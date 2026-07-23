@@ -1,0 +1,60 @@
+[package]
+name = "tack-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+postgres-types = { version = "0.2", features = ["derive", "with-uuid-1", "with-chrono-0_4"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# IDs & time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# In-process LRU cache (matches ullav-dam-server's thumbnail-cache pattern —
+# used here for anything worth caching, e.g. resolved cross-references)
+lru = "0.12"
+
+# Config & env
+dotenvy = "0.15"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# OpenAPI
+utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "7", features = ["axum"] }
+
+# JWT validation (RS256 via UUM JWKS)
+ullav-mcp-auth = { path = "../ullav-mcp-auth", default-features = false, features = ["axum-07"] }
+
+# HTTP client (auth proxy / cross-app reference resolution)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Embed migrations directory at compile time; run on every startup
+# (idempotent CREATE TABLE IF NOT EXISTS-style SQL) — matches ullav-dam-server's
+# migration pattern, not ullav-user-management's separate migrate-sidecar pattern.
+include_dir = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = true
