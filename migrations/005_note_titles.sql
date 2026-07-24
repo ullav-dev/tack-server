@@ -1,0 +1,12 @@
+-- Notes gain a title, matching Pages (title lives on the metadata row, not
+-- the body) and matching every other first-party app's own Notes model in
+-- this org (e.g. togra's `Note.title`) -- Tack's Notes were the outlier in
+-- not having one, which makes them unusable in a title-based navigator
+-- list. `ALTER TABLE` on a partitioned parent table cascades to every
+-- partition automatically, so this doesn't need the per-partition DO/EXECUTE
+-- loop the table-creation migrations use.
+--
+-- Default `''` so existing rows (and replies, which don't collect their own
+-- title -- only top-level notes do, enforced at the application layer, not
+-- here) stay valid without a backfill.
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';

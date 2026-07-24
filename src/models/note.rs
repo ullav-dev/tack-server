@@ -39,6 +39,9 @@ pub struct Note {
     pub team_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
     pub visibility: Visibility,
+    /// Empty for replies -- only top-level notes collect a title (enforced
+    /// in the handler, not the schema; see `handlers::notes::create_note`).
+    pub title: String,
     pub body_markdown: String,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
@@ -69,6 +72,7 @@ pub struct CreateNoteRequest {
     /// migration in ullav-user-management).
     pub team_id: Uuid,
     pub visibility: Visibility,
+    pub title: String,
     pub body_markdown: String,
 }
 
@@ -82,6 +86,10 @@ pub struct UpdateNoteRequest {
     /// Presence of this field creates a new revision.
     pub body_markdown: Option<String>,
     pub visibility: Option<Visibility>,
+    /// Not versioned in `note_revisions` (only `body_markdown` is) -- title
+    /// history isn't tracked, matching Pages, which doesn't version its
+    /// title either.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

@@ -19,6 +19,7 @@ fn row_to_note(row: &Row) -> Note {
         team_id: row.get("team_id"),
         parent_id: row.get("parent_id"),
         visibility: Visibility::from_db_str(row.get("visibility")),
+        title: row.get("title"),
         body_markdown: row.get("body_markdown"),
         created_by: row.get("created_by"),
         created_at: row.get("created_at"),
@@ -28,7 +29,7 @@ fn row_to_note(row: &Row) -> Note {
 }
 
 const NOTE_SELECT: &str = "
-    SELECT n.id, n.organization_id, n.team_id, n.parent_id, n.visibility,
+    SELECT n.id, n.organization_id, n.team_id, n.parent_id, n.visibility, n.title,
            n.created_by, n.created_at, n.updated_at,
            b.body_markdown,
            (SELECT COUNT(*) FROM notes r
@@ -43,6 +44,7 @@ pub struct NewNote {
     pub team_id: Uuid,
     pub visibility: Visibility,
     pub created_by: Uuid,
+    pub title: String,
     pub body_markdown: String,
 }
 
@@ -56,9 +58,17 @@ pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
     let thread_path = ltree_label(id);
 
     tx.execute(
-        "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, created_by)
-         VALUES ($1, $2, $3, $4::ltree, $5, $6)",
-        &[&id, &new.organization_id, &new.team_id, &thread_path, &new.visibility.as_db_str(), &new.created_by],
+        "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, title, created_by)
+         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7)",
+        &[
+            &id,
+            &new.organization_id,
+            &new.team_id,
+            &thread_path,
+            &new.visibility.as_db_str(),
+            &new.title,
+            &new.created_by,
+        ],
     )
     .await?;
 
@@ -216,17 +226,26 @@ pub async fn list_replies(pool: &Pool, parent_id: Uuid, organization_id: Uuid) -
     Ok(rows.iter().map(row_to_note).collect())
 }
 
-/// Edits a note's body (creating a new revision) and/or visibility.
+/// Edits a note's title, body (creating a new revision), and/or visibility.
 /// Caller must already be authorized (creator or admin) — enforced by the handler.
 pub async fn update_note(
     pool: &Pool,
     note: &Note,
+    new_title: Option<&str>,
     new_body: Option<&str>,
     new_visibility: Option<Visibility>,
     edited_by: Uuid,
 ) -> Result<Note, AppError> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+
+    if let Some(title) = new_title {
+        tx.execute(
+            "UPDATE notes SET title = $1, updated_at = NOW() WHERE id = $2 AND organization_id = $3",
+            &[&title, &note.id, &note.organization_id],
+        )
+        .await?;
+    }
 
     if let Some(body) = new_body {
         tx.execute(
@@ -265,7 +284,7 @@ pub async fn update_note(
         .await?;
     }
 
-    if new_body.is_some() || new_visibility.is_some() {
+    if new_title.is_some() || new_body.is_some() || new_visibility.is_some() {
         enqueue_outbox_event(&tx, note.organization_id, note.id, "updated").await?;
     }
 

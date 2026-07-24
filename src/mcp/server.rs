@@ -95,6 +95,7 @@ pub struct CreateNoteParams {
     pub team_id: String,
     /// One of "private", "team", "organization".
     pub visibility: String,
+    pub title: String,
     pub body_markdown: String,
 }
 
@@ -164,6 +165,9 @@ impl TackMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<String, rmcp::ErrorData> {
         let user = caller_from_ctx(&context)?;
+        if p.title.trim().is_empty() {
+            return Err(rmcp::ErrorData::invalid_params("title must not be empty", None));
+        }
         if p.body_markdown.trim().is_empty() {
             return Err(rmcp::ErrorData::invalid_params("body_markdown must not be empty", None));
         }
@@ -177,6 +181,7 @@ impl TackMcpServer {
                 team_id,
                 visibility,
                 created_by: user.user_id,
+                title: p.title,
                 body_markdown: p.body_markdown,
             },
         )
