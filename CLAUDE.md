@@ -45,10 +45,6 @@ Health check (`GET /health`) and a whoami endpoint (`GET /me`, gated by `TackUse
 
 **Embeddings/hybrid search is implemented and working end-to-end** (see above) — verified live: a genuinely long note chunked into 9 OpenSearch documents (each with a real 384-dim embedding), and a semantic query sharing zero literal words with the note's text still correctly ranked it above an unrelated note via kNN. No Pages yet — see the architecture plan's "Implementation sequencing" section for what's next.
 
-## Local dev prerequisite
-
-`ullav-mcp-auth`'s `TeamClaim` needs `products`/`organization_id` fields that only exist on its `feature/team-claim-org-products` branch (not yet merged — see `ullav-mcp-auth` PR #4). To build `tack-server` locally right now, the sibling `ullav-mcp-auth` checkout (the Cargo path dependency) must be on that branch, not `main`.
-
 ### Notes schema
 
 `migrations/001_notes.sql` (`spaces`/`notes`/`note_bodies`/`note_revisions`), `002_content_links.sql` (`content_attachments`/`content_references`), `003_outbox.sql` (`outbox_events`) — verified (fresh apply, idempotent restart, cascades, `ltree` queries — all against a real Postgres instance via the actual compiled binary, not just raw SQL).

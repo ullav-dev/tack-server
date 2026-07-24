@@ -1,4 +1,6 @@
 pub mod notes;
+pub mod pages;
+pub mod spaces;
 
 use anyhow::{Context, Result};
 use deadpool_postgres::{Config as PgConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
