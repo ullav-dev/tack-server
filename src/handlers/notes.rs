@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::note::{CreateNoteRequest, Note, NoteRevision, ReplyRequest, UpdateNoteRequest};
+use crate::models::note::{CreateNoteRequest, Note, NoteRevision, NotesPage, ReplyRequest, UpdateNoteRequest};
 use crate::notes_acl::{can_edit, resolve_team_organization, resolve_visible_note};
 use crate::AppState;
 
@@ -42,25 +42,39 @@ pub async fn create_note(
     Ok(Json(note))
 }
 
+const DEFAULT_NOTES_LIMIT: i64 = 20;
+const MAX_NOTES_LIMIT: i64 = 100;
+
 #[derive(Debug, Deserialize)]
 pub struct ListNotesQuery {
     pub team_id: Uuid,
+    /// Defaults to 20, capped at 100.
+    pub limit: Option<i64>,
+    /// Defaults to 0.
+    pub offset: Option<i64>,
 }
 
 #[utoipa::path(
     get,
     path = "/notes",
-    params(("team_id" = Uuid, Query, description = "List top-level notes filed under this team")),
-    responses((status = 200, description = "Top-level notes for this team", body = [Note])),
+    params(
+        ("team_id" = Uuid, Query, description = "List top-level notes filed under this team"),
+        ("limit" = Option<i64>, Query, description = "Page size, default 20, max 100"),
+        ("offset" = Option<i64>, Query, description = "Offset into the (newest-first) list, default 0"),
+    ),
+    responses((status = 200, description = "A page of top-level notes for this team", body = NotesPage)),
     tag = "notes"
 )]
 pub async fn list_notes(
     State(state): State<AppState>,
     user: TackUser,
     Query(query): Query<ListNotesQuery>,
-) -> AppResult<Json<Vec<Note>>> {
+) -> AppResult<Json<NotesPage>> {
     let organization_id = resolve_team_organization(&user, query.team_id)?;
-    let notes = db::notes::list_team_notes(&state.db, organization_id, query.team_id, user.user_id).await?;
+    let limit = query.limit.unwrap_or(DEFAULT_NOTES_LIMIT).clamp(1, MAX_NOTES_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let notes =
+        db::notes::list_team_notes(&state.db, organization_id, query.team_id, user.user_id, limit, offset).await?;
     Ok(Json(notes))
 }
 
