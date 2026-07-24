@@ -62,6 +62,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::pages::create_page,
         handlers::pages::list_pages,
         handlers::pages::get_page,
+        handlers::pages::get_page_permission,
         handlers::pages::update_page,
         handlers::pages::delete_page,
         handlers::pages::list_page_permissions,
@@ -85,6 +86,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::page::CreatePageRequest,
         models::page::UpdatePageRequest,
         models::page::PagePermission,
+        models::page::PagePermissionLevelResponse,
         models::page::CreatePagePermissionRequest,
         models::page::PermissionLevel,
         models::page::PrincipalType,
@@ -217,6 +219,7 @@ async fn main() -> Result<()> {
             "/pages/:id",
             get(handlers::pages::get_page).patch(handlers::pages::update_page).delete(handlers::pages::delete_page),
         )
+        .route("/pages/:id/permission", get(handlers::pages::get_page_permission))
         .route(
             "/pages/:id/permissions",
             post(handlers::pages::create_page_permission).get(handlers::pages::list_page_permissions),

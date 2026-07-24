@@ -124,6 +124,17 @@ pub struct PagePermission {
     pub created_at: DateTime<Utc>,
 }
 
+/// The caller's own effective permission level on a page — used by
+/// `GET /pages/{id}/permission`, which exists specifically so that
+/// tack-hocuspocus (a separate service, in a different language) can
+/// delegate ACL resolution back to this API rather than reimplementing
+/// `pages_acl`'s ancestor/space-fallback algorithm in TypeScript. Also
+/// useful to the frontend directly (e.g. to render the editor read-only).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PagePermissionLevelResponse {
+    pub level: PermissionLevel,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePagePermissionRequest {
     pub principal_type: PrincipalType,
