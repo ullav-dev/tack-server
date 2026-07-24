@@ -1,5 +1,10 @@
 use anyhow::Result;
-use axum::{extract::State, http::StatusCode, routing::get, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Router,
+};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use utoipa::OpenApi;
@@ -10,6 +15,7 @@ mod config;
 mod db;
 mod error;
 mod handlers;
+mod models;
 
 use config::Config;
 use db::DbPool;
@@ -27,11 +33,32 @@ pub struct AppState {
         version = "0.1.0",
         description = "Notes & Pages content platform"
     ),
-    paths(health, handlers::me::me),
-    components(schemas(error::ErrorResponse, handlers::me::MeResponse)),
+    paths(
+        health,
+        handlers::me::me,
+        handlers::notes::create_note,
+        handlers::notes::list_notes,
+        handlers::notes::get_note,
+        handlers::notes::update_note,
+        handlers::notes::delete_note,
+        handlers::notes::create_reply,
+        handlers::notes::list_replies,
+        handlers::notes::list_revisions,
+    ),
+    components(schemas(
+        error::ErrorResponse,
+        handlers::me::MeResponse,
+        models::note::Note,
+        models::note::Visibility,
+        models::note::CreateNoteRequest,
+        models::note::ReplyRequest,
+        models::note::UpdateNoteRequest,
+        models::note::NoteRevision,
+    )),
     tags(
         (name = "health", description = "Service health"),
         (name = "me", description = "Caller identity"),
+        (name = "notes", description = "Notes: threaded, entity-attached comments"),
     ),
 )]
 struct ApiDoc;
@@ -88,6 +115,18 @@ async fn main() -> Result<()> {
         .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
         .route("/me", get(handlers::me::me))
+        .route("/notes", post(handlers::notes::create_note).get(handlers::notes::list_notes))
+        .route(
+            "/notes/:id",
+            get(handlers::notes::get_note)
+                .patch(handlers::notes::update_note)
+                .delete(handlers::notes::delete_note),
+        )
+        .route(
+            "/notes/:id/replies",
+            post(handlers::notes::create_reply).get(handlers::notes::list_replies),
+        )
+        .route("/notes/:id/revisions", get(handlers::notes::list_revisions))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
