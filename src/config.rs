@@ -12,6 +12,10 @@ pub struct Config {
     /// OAuth2 resource-server audience. Defaults to a local dev URL; must be
     /// set to the real public URL in any deployed environment.
     pub tack_mcp_canonical_uri: String,
+    /// Where the local embedding model is cached (downloaded once on first
+    /// run if absent). Point this at a persistent volume in any deployed
+    /// environment so the model survives container restarts/redeploys.
+    pub embedding_model_cache_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -31,6 +35,9 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:9200".into()),
             tack_mcp_canonical_uri: std::env::var("TACK_MCP_CANONICAL_URI")
                 .unwrap_or_else(|_| "http://localhost:8087/mcp".into()),
+            embedding_model_cache_dir: std::env::var("EMBEDDING_MODEL_CACHE_DIR")
+                .unwrap_or_else(|_| "./.embedding-models".into())
+                .into(),
         })
     }
 

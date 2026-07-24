@@ -12,7 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
         curl \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
+# g++ (libstdc++) is required at link time by fastembed's dependencies
+# (onnxruntime via `ort`, `onig` for tokenizer regex) -- see Dockerfile's
+# comment for the same fix.
 
 # Path dependency — checked out as a sibling in CI and copied here.
 COPY ullav-mcp-auth /ullav-mcp-auth
@@ -45,6 +49,9 @@ RUN useradd -m -u 1001 tack
 WORKDIR /app
 
 COPY --from=builder /app/target/release/tack-indexer ./tack-indexer
+# See Dockerfile's comment: the embedding model cache dir needs to be
+# writable by the unprivileged `tack` user.
+RUN mkdir -p .embedding-models && chown -R tack:tack /app
 
 USER tack
 

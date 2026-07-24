@@ -7,7 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
         curl \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
+# g++ (libstdc++) is required at link time by fastembed's dependencies
+# (onnxruntime via `ort`, `onig` for tokenizer regex) -- both link against
+# the C++ standard library, which `rust:*-slim` doesn't ship by default.
 
 # Path dependency — checked out as a sibling in CI and copied here.
 COPY ullav-mcp-auth /ullav-mcp-auth
@@ -44,6 +48,12 @@ RUN useradd -m -u 1001 tack
 WORKDIR /app
 
 COPY --from=builder /app/target/release/tack-server ./tack-server
+# The embedding model is downloaded into EMBEDDING_MODEL_CACHE_DIR
+# (default ./.embedding-models, i.e. /app/.embedding-models) on first run --
+# /app is root-owned by default, so the unprivileged `tack` user can't write
+# there without this. Mount a persistent volume over this same path in any
+# deployed environment so the model survives container restarts/redeploys.
+RUN mkdir -p .embedding-models && chown -R tack:tack /app
 
 USER tack
 EXPOSE 8087

@@ -57,6 +57,11 @@ reqwest = { version = "0.12", features = ["json"] }
 # migration pattern, not ullav-user-management's separate migrate-sidecar pattern.
 include_dir = "0.7"
 
+# Self-hosted local embedding model (ONNX Runtime under the hood, via `ort`) —
+# no external API calls or per-embedding cost, per the explicit decision to
+# keep semantic search self-hosted rather than calling an external provider.
+fastembed = "4"
+
 [profile.release]
 opt-level = 3
 lto = true

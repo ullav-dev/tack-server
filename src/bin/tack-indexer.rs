@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use std::time::Duration;
-use tack_server::{config::Config, db, search::SearchClient};
+use tack_server::{config::Config, db, embeddings::Embedder, search::SearchClient};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
@@ -51,10 +51,29 @@ async fn main() -> Result<()> {
     let search = SearchClient::new(cfg.opensearch_url);
     search.ensure_index().await?;
 
+    // Same non-fatal-degrade posture as tack-server: if the model can't
+    // load, keep indexing lexically rather than refusing to start -- a
+    // model that comes back later (e.g. cache volume mounted on redeploy)
+    // just needs a re-index, not a code change.
+    let embedder = {
+        let cache_dir = cfg.embedding_model_cache_dir.clone();
+        match tokio::task::spawn_blocking(move || Embedder::new(cache_dir)).await {
+            Ok(Ok(embedder)) => Some(embedder),
+            Ok(Err(e)) => {
+                tracing::warn!("embedding model failed to load, indexing lexical-only: {e:#}");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("embedding model load task panicked, indexing lexical-only: {e:#}");
+                None
+            }
+        }
+    };
+
     tracing::info!("tack-indexer started, polling every {POLL_INTERVAL:?}");
 
     loop {
-        match process_batch(&pool, &search).await {
+        match process_batch(&pool, &search, embedder.as_ref()).await {
             Ok(0) => tokio::time::sleep(POLL_INTERVAL).await,
             Ok(n) => tracing::info!("processed {n} outbox event(s)"),
             Err(e) => {
@@ -65,7 +84,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn process_batch(pool: &db::DbPool, search: &SearchClient) -> Result<usize> {
+async fn process_batch(pool: &db::DbPool, search: &SearchClient, embedder: Option<&Embedder>) -> Result<usize> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
 
@@ -98,7 +117,7 @@ async fn process_batch(pool: &db::DbPool, search: &SearchClient) -> Result<usize
 
     let mut processed = 0;
     for event in &events {
-        match apply_event(pool, search, event).await {
+        match apply_event(pool, search, event, embedder).await {
             Ok(()) => {
                 tx.execute("UPDATE outbox_events SET processed_at = NOW() WHERE id = $1", &[&event.id])
                     .await?;
@@ -119,7 +138,12 @@ async fn process_batch(pool: &db::DbPool, search: &SearchClient) -> Result<usize
     Ok(processed)
 }
 
-async fn apply_event(pool: &db::DbPool, search: &SearchClient, event: &OutboxEvent) -> Result<()> {
+async fn apply_event(
+    pool: &db::DbPool,
+    search: &SearchClient,
+    event: &OutboxEvent,
+    embedder: Option<&Embedder>,
+) -> Result<()> {
     if event.content_type != "note" {
         // Pages don't exist yet -- nothing to do, not an error.
         return Ok(());
@@ -128,7 +152,7 @@ async fn apply_event(pool: &db::DbPool, search: &SearchClient, event: &OutboxEve
         return search.delete_note(event.content_id).await;
     }
     match db::notes::get_note(pool, event.content_id, event.organization_id).await {
-        Ok(Some(note)) => search.index_note(&note).await,
+        Ok(Some(note)) => search.index_note(&note, embedder).await,
         // Soft-deleted or otherwise gone by the time we got to it -- nothing to index.
         Ok(None) => Ok(()),
         Err(e) => Err(anyhow::anyhow!(e)),

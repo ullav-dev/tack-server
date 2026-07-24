@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod embeddings;
 pub mod error;
 pub mod models;
 pub mod search;
@@ -13,4 +14,9 @@ pub struct AppState {
     pub db: db::DbPool,
     pub api_validator: ullav_mcp_auth::TokenValidator,
     pub search: search::SearchClient,
+    /// `None` if the embedding model failed to load at startup (e.g. no
+    /// cached model and no outbound internet on first run) — semantic
+    /// search degrades to lexical-only rather than the whole server
+    /// refusing to start, same resilience posture as OpenSearch being down.
+    pub embedder: Option<embeddings::Embedder>,
 }
