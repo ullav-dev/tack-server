@@ -1,3 +1,5 @@
+pub mod notes;
+
 use anyhow::{Context, Result};
 use deadpool_postgres::{Config as PgConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use include_dir::{include_dir, Dir};
