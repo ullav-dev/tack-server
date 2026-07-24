@@ -179,21 +179,31 @@ pub async fn get_note_admin_any_org(pool: &Pool, id: Uuid) -> Result<Option<Note
 /// private notes that don't belong to the caller — the handler has already
 /// verified the caller is a member of `team_id`, so team- and
 /// organization-visibility notes are unconditionally included here.
+///
+/// Simple offset pagination: fetches `limit + 1` rows so `has_more` can be
+/// derived from whether that extra row came back, without a separate
+/// `COUNT(*)` query — a team's note volume doesn't yet warrant cursor-based
+/// pagination's extra complexity.
 pub async fn list_team_notes(
     pool: &Pool,
     organization_id: Uuid,
     team_id: Uuid,
     caller_id: Uuid,
-) -> Result<Vec<Note>, AppError> {
+    limit: i64,
+    offset: i64,
+) -> Result<crate::models::note::NotesPage, AppError> {
     let client = pool.get().await?;
     let sql = format!(
         "{NOTE_SELECT}
          WHERE n.organization_id = $1 AND n.team_id = $2 AND n.parent_id IS NULL AND n.deleted_at IS NULL
            AND (n.visibility != 'private' OR n.created_by = $3)
-         ORDER BY n.created_at DESC"
+         ORDER BY n.created_at DESC
+         LIMIT $4 OFFSET $5"
     );
-    let rows = client.query(&sql, &[&organization_id, &team_id, &caller_id]).await?;
-    Ok(rows.iter().map(row_to_note).collect())
+    let rows = client.query(&sql, &[&organization_id, &team_id, &caller_id, &(limit + 1), &offset]).await?;
+    let has_more = rows.len() as i64 > limit;
+    let notes = rows.iter().take(limit as usize).map(row_to_note).collect();
+    Ok(crate::models::note::NotesPage { notes, has_more })
 }
 
 pub async fn list_replies(pool: &Pool, parent_id: Uuid, organization_id: Uuid) -> Result<Vec<Note>, AppError> {

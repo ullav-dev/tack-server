@@ -48,6 +48,18 @@ pub struct Note {
     pub reply_count: i64,
 }
 
+/// A page of top-level notes for a team, oldest-first pagination via
+/// `limit`/`offset` — simple offset pagination, not cursor-based, since a
+/// team's note volume doesn't yet warrant the extra complexity (see
+/// `handlers::notes::list_notes`).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NotesPage {
+    pub notes: Vec<Note>,
+    /// `true` if there are more notes beyond this page (requesting the next
+    /// `offset` will return further results).
+    pub has_more: bool,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateNoteRequest {
     /// The team to file this note under. Required even for a `private` note —
