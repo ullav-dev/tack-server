@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use tack_server::auth::{self, TackUser};
 use tack_server::db::{self, DbPool};
+use tack_server::embeddings::Embedder;
 use tack_server::models::note::Visibility;
 use tack_server::search::{SearchCaller, SearchClient};
 
@@ -109,17 +110,19 @@ pub struct ReplyToNoteParams {
 pub struct TackMcpServer {
     db: DbPool,
     search: SearchClient,
+    embedder: Option<Embedder>,
 }
 
 impl TackMcpServer {
-    fn new(db: DbPool, search: SearchClient) -> Self {
-        Self { db, search }
+    fn new(db: DbPool, search: SearchClient, embedder: Option<Embedder>) -> Self {
+        Self { db, search, embedder }
     }
 }
 
 #[tool_router]
 impl TackMcpServer {
-    /// Search across the caller's visible Notes (lexical/BM25 for now).
+    /// Search across the caller's visible Notes (hybrid BM25 + semantic when
+    /// the embedding model is loaded).
     #[tool(description = "Search Tack content the caller has access to")]
     async fn search_content(
         &self,
@@ -133,7 +136,7 @@ impl TackMcpServer {
             team_ids: user.teams.keys().copied().collect(),
             organization_ids: user.organization_ids(),
         };
-        let hits = self.search.search(&p.query, &caller).await.map_err(app_err)?;
+        let hits = self.search.search(&p.query, &caller, self.embedder.as_ref()).await.map_err(app_err)?;
         let limit = p.limit.unwrap_or(20).max(0) as usize;
         let hits = &hits[..hits.len().min(limit)];
         Ok(serde_json::to_string_pretty(hits).unwrap())
@@ -219,6 +222,7 @@ impl rmcp::ServerHandler for TackMcpServer {
 pub fn make_tack_mcp_service(
     db: DbPool,
     search: SearchClient,
+    embedder: Option<Embedder>,
     external_host: &str,
 ) -> StreamableHttpService<TackMcpServer, LocalSessionManager> {
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -228,7 +232,11 @@ pub fn make_tack_mcp_service(
         "::1",
         external_host,
     ]);
-    StreamableHttpService::new(move || Ok(TackMcpServer::new(db.clone(), search.clone())), session_manager, config)
+    StreamableHttpService::new(
+        move || Ok(TackMcpServer::new(db.clone(), search.clone(), embedder.clone())),
+        session_manager,
+        config,
+    )
 }
 
 #[cfg(test)]

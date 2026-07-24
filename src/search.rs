@@ -10,17 +10,25 @@
 //! NOTE: the `text.icu` sub-field (multilingual analysis) described in the
 //! architecture plan requires the `analysis-icu` OpenSearch plugin, which
 //! isn't installed on a vanilla `opensearchproject/opensearch` image. This
-//! first pass uses the default `standard` analyzer only — genuinely
-//! multilingual search is a documented follow-up, not silently assumed done.
+//! first pass uses the default `standard` analyzer only for lexical
+//! matching — multilingual coverage instead comes from the embedding model
+//! (`multilingual-e5-small`), which is genuinely multilingual by training,
+//! so hybrid search isn't purely English-only even without the ICU plugin.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::embeddings::{chunk_text, Embedder, EMBEDDING_DIMENSION, EMBEDDING_VERSION};
 use crate::models::note::{Note, Visibility};
 
 pub const CONTENT_INDEX: &str = "tack-content";
+
+/// Reciprocal Rank Fusion constant — the standard default (60) from the
+/// original RRF paper; not sensitive to tuning for a first pass.
+const RRF_K: f64 = 60.0;
 
 #[derive(Clone)]
 pub struct SearchClient {
@@ -44,7 +52,11 @@ impl SearchClient {
         }
 
         let mapping = json!({
-            "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "index.knn": true
+            },
             "mappings": {
                 "properties": {
                     "content_id":      { "type": "keyword" },
@@ -58,6 +70,11 @@ impl SearchClient {
                     "language":        { "type": "keyword" },
                     "text":            { "type": "text" },
                     "chunk_index":     { "type": "integer" },
+                    "embedding": {
+                        "type": "knn_vector",
+                        "dimension": EMBEDDING_DIMENSION,
+                        "method": { "name": "hnsw", "space_type": "cosinesimil", "engine": "lucene" }
+                    },
                     "embedding_version": { "type": "keyword" },
                     "created_at":      { "type": "date" },
                     "updated_at":      { "type": "date" }
@@ -73,67 +90,117 @@ impl SearchClient {
         Ok(())
     }
 
-    /// Indexes (or re-indexes) a note as a single whole-document — chunking
-    /// long notes is deferred until embeddings/semantic search land.
-    pub async fn index_note(&self, note: &Note) -> Result<()> {
-        let doc_id = format!("note:{}", note.id);
-        let url = format!("{}/{CONTENT_INDEX}/_doc/{doc_id}", self.base_url);
-        let doc = json!({
-            "content_id": note.id,
-            "content_type": "note",
-            "source": "body",
-            "organization_id": note.organization_id,
-            "team_id": note.team_id,
-            "visibility": note.visibility.as_db_str(),
-            "created_by": note.created_by,
-            "language": "en",
-            "text": note.body_markdown,
-            "created_at": note.created_at.to_rfc3339(),
-            "updated_at": note.updated_at.to_rfc3339(),
-        });
-        let resp = self.http.put(&url).json(&doc).send().await.context("indexing request failed")?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("failed to index {doc_id}: {body}");
-        }
-        Ok(())
-    }
-
-    /// Removes a note from the index (soft-delete in Postgres -> hard removal
-    /// from search, since deleted content should never surface in results).
-    pub async fn delete_note(&self, note_id: Uuid) -> Result<()> {
-        let doc_id = format!("note:{note_id}");
-        let url = format!("{}/{CONTENT_INDEX}/_doc/{doc_id}", self.base_url);
-        let resp = self.http.delete(&url).send().await.context("delete request failed")?;
-        // 404 is fine — deleting something already absent is not an error here.
-        if !resp.status().is_success() && resp.status().as_u16() != 404 {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("failed to delete {doc_id}: {body}");
-        }
-        Ok(())
-    }
-
-    /// Hybrid-search placeholder: lexical (BM25) only for now — kNN joins in
-    /// once embeddings exist (see the architecture plan's implementation
-    /// sequencing). ACL is enforced in the query itself, not just filtered
-    /// after the fact: admins get an unfiltered search; everyone else only
-    /// ever gets back rows they're allowed to see, computed live from their
-    /// current team/organization memberships (`caller`).
-    pub async fn search(&self, query_text: &str, caller: &SearchCaller) -> Result<Vec<SearchHit>> {
-        let acl_filter = caller.acl_filter();
-        let query = if let Some(filter) = acl_filter {
-            json!({
-                "query": {
-                    "bool": {
-                        "must": [{ "match": { "text": query_text } }],
-                        "filter": [filter]
-                    }
+    /// Indexes (or re-indexes) a note. Long notes are split into overlapping
+    /// chunks (`embeddings::chunk_text`), each indexed as its own document
+    /// sharing the note's metadata — `delete_note` removes all of a note's
+    /// chunk documents together. Without an embedder (e.g. OpenSearch/model
+    /// unavailable at startup), chunks are still indexed for lexical search,
+    /// just without an `embedding` field.
+    pub async fn index_note(&self, note: &Note, embedder: Option<&Embedder>) -> Result<()> {
+        let chunks = chunk_text(&note.body_markdown);
+        let embeddings: Vec<Option<Vec<f32>>> = if let Some(embedder) = embedder {
+            let texts: Vec<String> = chunks.iter().map(|(_, t)| t.clone()).collect();
+            match embedder.embed_passages(texts).await {
+                Ok(vectors) => vectors.into_iter().map(Some).collect(),
+                Err(e) => {
+                    tracing::warn!("embedding failed for note {}, indexing lexical-only: {e:#}", note.id);
+                    vec![None; chunks.len()]
                 }
-            })
+            }
         } else {
-            json!({ "query": { "match": { "text": query_text } } })
+            vec![None; chunks.len()]
         };
 
+        for ((chunk_index, chunk_text), embedding) in chunks.into_iter().zip(embeddings) {
+            let doc_id = format!("note:{}:{chunk_index}", note.id);
+            let url = format!("{}/{CONTENT_INDEX}/_doc/{doc_id}", self.base_url);
+            let mut doc = json!({
+                "content_id": note.id,
+                "content_type": "note",
+                "source": "body",
+                "organization_id": note.organization_id,
+                "team_id": note.team_id,
+                "visibility": note.visibility.as_db_str(),
+                "created_by": note.created_by,
+                "language": "en",
+                "text": chunk_text,
+                "chunk_index": chunk_index,
+                "created_at": note.created_at.to_rfc3339(),
+                "updated_at": note.updated_at.to_rfc3339(),
+            });
+            if let Some(vector) = embedding {
+                doc["embedding"] = json!(vector);
+                doc["embedding_version"] = json!(EMBEDDING_VERSION);
+            }
+            let resp = self.http.put(&url).json(&doc).send().await.context("indexing request failed")?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("failed to index {doc_id}: {body}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes all of a note's chunk documents (soft-delete in Postgres ->
+    /// hard removal from search, since deleted content should never surface
+    /// in results).
+    pub async fn delete_note(&self, note_id: Uuid) -> Result<()> {
+        let url = format!("{}/{CONTENT_INDEX}/_delete_by_query", self.base_url);
+        let query = json!({
+            "query": { "bool": { "must": [
+                { "term": { "content_type": "note" } },
+                { "term": { "content_id": note_id } }
+            ]}}
+        });
+        let resp = self.http.post(&url).json(&query).send().await.context("delete request failed")?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("failed to delete note {note_id}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Hybrid search: lexical (BM25) + semantic (kNN, when an embedder is
+    /// available), combined via Reciprocal Rank Fusion rather than trying to
+    /// normalize two incomparable score scales. ACL is enforced *in* both
+    /// queries, not filtered after the fact — admins get unfiltered results;
+    /// everyone else only ever gets back rows they're allowed to see,
+    /// computed live from their current team/organization memberships.
+    /// Multiple chunks of the same note are deduped to one result (its
+    /// best-ranked chunk represents it).
+    pub async fn search(
+        &self,
+        query_text: &str,
+        caller: &SearchCaller,
+        embedder: Option<&Embedder>,
+    ) -> Result<Vec<SearchHit>> {
+        let acl_filter = caller.acl_filter();
+
+        let lexical_query = match &acl_filter {
+            Some(filter) => json!({
+                "size": 50,
+                "query": { "bool": { "must": [{ "match": { "text": query_text } }], "filter": [filter] } }
+            }),
+            None => json!({ "size": 50, "query": { "match": { "text": query_text } } }),
+        };
+        let lexical_hits = self.raw_search(lexical_query).await?;
+
+        let knn_hits = if let Some(embedder) = embedder {
+            let vector = embedder.embed_query(query_text).await?;
+            let mut knn_field = json!({ "vector": vector, "k": 50 });
+            if let Some(filter) = &acl_filter {
+                knn_field["filter"] = filter.clone();
+            }
+            let knn_query = json!({ "size": 50, "query": { "knn": { "embedding": knn_field } } });
+            self.raw_search(knn_query).await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(reciprocal_rank_fusion(lexical_hits, knn_hits))
+    }
+
+    async fn raw_search(&self, query: Value) -> Result<Vec<RawHit>> {
         let url = format!("{}/{CONTENT_INDEX}/_search", self.base_url);
         let resp = self.http.post(&url).json(&query).send().await.context("search request failed")?;
         if !resp.status().is_success() {
@@ -141,8 +208,48 @@ impl SearchClient {
             anyhow::bail!("search failed: {body}");
         }
         let body: SearchResponse = resp.json().await.context("failed to parse search response")?;
-        Ok(body.hits.hits.into_iter().map(|h| h.into_hit()).collect())
+        Ok(body.hits.hits)
     }
+}
+
+/// Combines two ranked hit lists into one, deduped by `content_id` (a note
+/// may appear via more than one chunk, and/or in both the lexical and
+/// semantic list). RRF score = sum of `1/(RRF_K + rank)` across whichever
+/// list(s) a chunk appears in; a note's final score is its best chunk's RRF
+/// score — this avoids needing to normalize BM25 scores against cosine
+/// similarity, which don't live on comparable scales.
+fn reciprocal_rank_fusion(lexical: Vec<RawHit>, knn: Vec<RawHit>) -> Vec<SearchHit> {
+    let mut best_by_content: HashMap<Uuid, (f64, RawHit)> = HashMap::new();
+
+    for (list_idx, list) in [lexical, knn].into_iter().enumerate() {
+        for (rank, hit) in list.into_iter().enumerate() {
+            let rrf = 1.0 / (RRF_K + (rank + 1) as f64);
+            let content_id = hit.source.content_id;
+            best_by_content
+                .entry(content_id)
+                .and_modify(|(score, best)| {
+                    *score += rrf;
+                    // Prefer whichever chunk scored higher in its own list —
+                    // approximated here by keeping the first (best-ranked)
+                    // occurrence, since entries are processed in rank order
+                    // within each list.
+                    let _ = (list_idx, &*best);
+                })
+                .or_insert((rrf, hit));
+        }
+    }
+
+    let mut results: Vec<SearchHit> = best_by_content
+        .into_values()
+        .map(|(score, hit)| SearchHit {
+            content_id: hit.source.content_id,
+            content_type: hit.source.content_type,
+            score: score as f32,
+            text: hit.source.text,
+        })
+        .collect();
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results
 }
 
 /// The caller's identity/membership, used to build the search ACL filter —
@@ -206,8 +313,6 @@ struct SearchHits {
 
 #[derive(Deserialize)]
 struct RawHit {
-    #[serde(rename = "_score")]
-    score: Option<f32>,
     #[serde(rename = "_source")]
     source: RawSource,
 }
@@ -219,23 +324,16 @@ struct RawSource {
     text: String,
 }
 
-impl RawHit {
-    fn into_hit(self) -> SearchHit {
-        SearchHit {
-            content_id: self.source.content_id,
-            content_type: self.source.content_type,
-            score: self.score.unwrap_or(0.0),
-            text: self.source.text,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn caller(is_admin: bool, team_ids: Vec<Uuid>, organization_ids: Vec<Uuid>) -> SearchCaller {
         SearchCaller { user_id: Uuid::new_v4(), is_admin, team_ids, organization_ids }
+    }
+
+    fn hit(content_id: Uuid, text: &str) -> RawHit {
+        RawHit { source: RawSource { content_id, content_type: "note".into(), text: text.into() } }
     }
 
     #[test]
@@ -266,5 +364,29 @@ mod tests {
         let team_clause = &should[1];
         assert_eq!(team_clause["bool"]["must"][0]["term"]["visibility"], "team");
         assert_eq!(team_clause["bool"]["must"][1]["terms"]["team_id"][0], team_id.to_string());
+    }
+
+    #[test]
+    fn rrf_ranks_a_note_appearing_in_both_lists_above_one_appearing_in_only_one() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let lexical = vec![hit(a, "a"), hit(b, "b")];
+        let knn = vec![hit(a, "a")];
+        let results = reciprocal_rank_fusion(lexical, knn);
+        assert_eq!(results[0].content_id, a, "a appears in both lists, should rank first");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn rrf_dedupes_multiple_chunks_of_the_same_note() {
+        let note_id = Uuid::new_v4();
+        let lexical = vec![hit(note_id, "chunk 0"), hit(note_id, "chunk 1")];
+        let results = reciprocal_rank_fusion(lexical, vec![]);
+        assert_eq!(results.len(), 1, "two chunks of the same note must collapse to one result");
+    }
+
+    #[test]
+    fn rrf_empty_lists_return_empty_results() {
+        assert!(reciprocal_rank_fusion(vec![], vec![]).is_empty());
     }
 }

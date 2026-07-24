@@ -12,11 +12,11 @@ pub struct SearchQuery {
     pub q: String,
 }
 
-/// Lexical (BM25) search across the caller's visible content — ACL is
-/// enforced *in* the search query itself (see `SearchCaller::acl_filter`),
-/// resolved live from the caller's current JWT team/org claims on every
-/// call, same as direct reads via `GET /notes/:id`. Hybrid (+kNN/semantic)
-/// search lands once embeddings exist.
+/// Hybrid (BM25 + kNN semantic) search across the caller's visible content —
+/// ACL is enforced *in* both queries themselves (see
+/// `SearchCaller::acl_filter`), resolved live from the caller's current JWT
+/// team/org claims on every call, same as direct reads via `GET /notes/:id`.
+/// Degrades to lexical-only if the embedding model isn't loaded.
 #[utoipa::path(
     get,
     path = "/search",
@@ -35,6 +35,6 @@ pub async fn search(
         team_ids: user.teams.keys().copied().collect(),
         organization_ids: user.organization_ids(),
     };
-    let hits = state.search.search(&query.q, &caller).await?;
+    let hits = state.search.search(&query.q, &caller, state.embedder.as_ref()).await?;
     Ok(Json(hits))
 }

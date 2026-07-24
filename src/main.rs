@@ -17,7 +17,7 @@ mod handlers;
 mod mcp;
 mod notes_acl;
 
-use tack_server::{auth, config, db, error, models, search, AppState};
+use tack_server::{auth, config, db, embeddings, error, models, search, AppState};
 
 use config::Config;
 use search::SearchClient;
@@ -121,6 +121,25 @@ async fn main() -> Result<()> {
         tracing::warn!("OpenSearch not reachable at startup, continuing without it: {e:#}");
     }
 
+    // Loading the embedding model is CPU/blocking work and, on a fresh cache
+    // dir, a one-time download -- same non-fatal-degrade posture as
+    // OpenSearch above: semantic search is a bonus on top of lexical search,
+    // never a startup requirement.
+    let embedder = {
+        let cache_dir = cfg.embedding_model_cache_dir.clone();
+        match tokio::task::spawn_blocking(move || embeddings::Embedder::new(cache_dir)).await {
+            Ok(Ok(embedder)) => Some(embedder),
+            Ok(Err(e)) => {
+                tracing::warn!("embedding model failed to load, continuing lexical-only: {e:#}");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("embedding model load task panicked, continuing lexical-only: {e:#}");
+                None
+            }
+        }
+    };
+
     let addr: std::net::SocketAddr = cfg.bind_addr().parse()?;
 
     let mcp_token_validator =
@@ -131,8 +150,12 @@ async fn main() -> Result<()> {
         scopes_supported: vec!["tack:tools".to_owned()],
         jwks_uri: cfg.oauth2_jwks_url.clone(),
     };
-    let mcp_service =
-        mcp::make_tack_mcp_service(pool.clone(), search_client.clone(), host_from_uri(&cfg.tack_mcp_canonical_uri));
+    let mcp_service = mcp::make_tack_mcp_service(
+        pool.clone(),
+        search_client.clone(),
+        embedder.clone(),
+        host_from_uri(&cfg.tack_mcp_canonical_uri),
+    );
 
     let state = AppState {
         db: pool,
@@ -145,6 +168,7 @@ async fn main() -> Result<()> {
             String::new(),
         ),
         search: search_client,
+        embedder,
     };
 
     let app = Router::new()
