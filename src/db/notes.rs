@@ -25,12 +25,13 @@ fn row_to_note(row: &Row) -> Note {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         reply_count: row.get("reply_count"),
+        in_reply_to_version: row.get("in_reply_to_version"),
     }
 }
 
 const NOTE_SELECT: &str = "
     SELECT n.id, n.organization_id, n.team_id, n.parent_id, n.visibility, n.title,
-           n.created_by, n.created_at, n.updated_at,
+           n.created_by, n.created_at, n.updated_at, n.in_reply_to_version,
            b.body_markdown,
            (SELECT COUNT(*) FROM notes r
             WHERE r.parent_id = n.id AND r.organization_id = n.organization_id AND r.deleted_at IS NULL
@@ -85,7 +86,11 @@ pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
 /// Creates a reply: inherits organization_id/team_id/visibility from the
 /// parent note (a reply can't have a broader or narrower audience than its
 /// parent — same precedent as awe-server's own notes, which force
-/// `is_shared=true` on replies to shared notes).
+/// `is_shared=true` on replies to shared notes). Also tags the reply with
+/// the parent's latest saved version number, so it can later be shown only
+/// while browsing that version (see `in_reply_to_version` on the model) —
+/// there's always at least version 1 (auto-created at note-creation time),
+/// so this is never null for a freshly created reply.
 pub async fn create_reply(
     pool: &Pool,
     parent: &Note,
@@ -105,9 +110,18 @@ pub async fn create_reply(
     let parent_path: String = parent_row.get(0);
     let thread_path = format!("{parent_path}.{}", ltree_label(id));
 
+    let version_row = tx
+        .query_one(
+            "SELECT COALESCE(MAX(version), 1) FROM note_revisions
+             WHERE note_id = $1 AND organization_id = $2",
+            &[&parent.id, &parent.organization_id],
+        )
+        .await?;
+    let in_reply_to_version: i32 = version_row.get(0);
+
     tx.execute(
-        "INSERT INTO notes (id, organization_id, team_id, thread_path, parent_id, visibility, created_by)
-         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7)",
+        "INSERT INTO notes (id, organization_id, team_id, thread_path, parent_id, visibility, created_by, in_reply_to_version)
+         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7, $8)",
         &[
             &id,
             &parent.organization_id,
@@ -116,6 +130,7 @@ pub async fn create_reply(
             &parent.id,
             &parent.visibility.as_db_str(),
             &created_by,
+            &in_reply_to_version,
         ],
     )
     .await?;
@@ -345,6 +360,51 @@ pub async fn create_revision(pool: &Pool, note: &Note, edited_by: Uuid) -> Resul
         edited_by: row.get("edited_by"),
         edited_at: row.get("edited_at"),
     })
+}
+
+/// Deletes a single saved version. Caller must already be authorized
+/// (creator or admin) — enforced by the handler. Refuses to delete the last
+/// remaining revision: a note always needs at least one version to anchor
+/// against (both as a baseline snapshot and as the fallback
+/// `in_reply_to_version` for replies made before any explicit save).
+///
+/// Known gap, deliberately not solved here: a reply tagged to the deleted
+/// version's number stays tagged to that number — if no other revision
+/// shares it, that reply becomes unreachable from history browsing (though
+/// it still shows up under "current" if its number happens to match
+/// whatever the new latest version is). Reassigning orphaned replies to the
+/// nearest surviving version is a reasonable follow-up, not done yet.
+pub async fn delete_revision(
+    pool: &Pool,
+    note: &Note,
+    revision_id: Uuid,
+) -> Result<(), AppError> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+
+    let count_row = tx
+        .query_one(
+            "SELECT COUNT(*) FROM note_revisions WHERE note_id = $1 AND organization_id = $2",
+            &[&note.id, &note.organization_id],
+        )
+        .await?;
+    let count: i64 = count_row.get(0);
+    if count <= 1 {
+        return Err(AppError::BadRequest("Can't delete the only remaining version.".into()));
+    }
+
+    let deleted = tx
+        .execute(
+            "DELETE FROM note_revisions WHERE id = $1 AND note_id = $2 AND organization_id = $3",
+            &[&revision_id, &note.id, &note.organization_id],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound("Version not found.".into()));
+    }
+
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn list_revisions(
