@@ -124,15 +124,9 @@ pub async fn update_note(
             return Err(AppError::BadRequest("body_markdown must not be empty".into()));
         }
     }
-    let updated = db::notes::update_note(
-        &state.db,
-        &note,
-        body.title.as_deref(),
-        body.body_markdown.as_deref(),
-        body.visibility,
-        user.user_id,
-    )
-    .await?;
+    let updated =
+        db::notes::update_note(&state.db, &note, body.title.as_deref(), body.body_markdown.as_deref(), body.visibility)
+            .await?;
     Ok(Json(updated))
 }
 
@@ -206,5 +200,27 @@ pub async fn list_revisions(
     let note = resolve_visible_note(&state.db, &user, id).await?;
     let revisions = db::notes::list_revisions(&state.db, note.id, note.organization_id).await?;
     Ok(Json(revisions))
+}
+
+/// Snapshots the note's current body as a new named version — a deliberate
+/// action, not an automatic side effect of every `PATCH` (see
+/// `db::notes::create_revision`).
+#[utoipa::path(
+    post,
+    path = "/notes/{id}/revisions",
+    responses((status = 201, description = "New version created", body = NoteRevision)),
+    tag = "notes"
+)]
+pub async fn create_revision(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<NoteRevision>> {
+    let note = resolve_visible_note(&state.db, &user, id).await?;
+    if !can_edit(&note, &user) {
+        return Err(AppError::Forbidden("Only the creator or an admin can create a version of this note.".into()));
+    }
+    let revision = db::notes::create_revision(&state.db, &note, user.user_id).await?;
+    Ok(Json(revision))
 }
 
