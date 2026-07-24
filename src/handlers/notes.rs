@@ -24,6 +24,9 @@ pub async fn create_note(
     user: TackUser,
     Json(body): Json<CreateNoteRequest>,
 ) -> AppResult<Json<Note>> {
+    if body.title.trim().is_empty() {
+        return Err(AppError::BadRequest("title must not be empty".into()));
+    }
     if body.body_markdown.trim().is_empty() {
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
@@ -35,6 +38,7 @@ pub async fn create_note(
             team_id: body.team_id,
             visibility: body.visibility,
             created_by: user.user_id,
+            title: body.title,
             body_markdown: body.body_markdown,
         },
     )
@@ -110,6 +114,11 @@ pub async fn update_note(
     if !can_edit(&note, &user) {
         return Err(AppError::Forbidden("Only the creator or an admin can edit this note.".into()));
     }
+    if let Some(ref title) = body.title {
+        if title.trim().is_empty() {
+            return Err(AppError::BadRequest("title must not be empty".into()));
+        }
+    }
     if let Some(ref body_markdown) = body.body_markdown {
         if body_markdown.trim().is_empty() {
             return Err(AppError::BadRequest("body_markdown must not be empty".into()));
@@ -118,6 +127,7 @@ pub async fn update_note(
     let updated = db::notes::update_note(
         &state.db,
         &note,
+        body.title.as_deref(),
         body.body_markdown.as_deref(),
         body.visibility,
         user.user_id,

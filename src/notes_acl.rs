@@ -81,6 +81,7 @@ mod tests {
             team_id: team,
             parent_id: None,
             visibility,
+            title: "title".into(),
             body_markdown: "body".into(),
             created_by,
             created_at: Utc::now(),
