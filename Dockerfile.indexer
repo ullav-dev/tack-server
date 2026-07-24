@@ -1,3 +1,8 @@
+# tack-indexer: the outbox-draining worker that keeps OpenSearch in sync
+# with Postgres. Same crate as tack-server (two [[bin]]s), built and
+# deployed as its own container/process so indexing load never competes
+# with the API server's request-serving resources.
+#
 # ── Build stage ───────────────────────────────────────────────────────────────
 FROM rust:1.91-slim-bookworm AS builder
 
@@ -19,19 +24,15 @@ RUN mkdir -p src/bin \
     && echo 'fn main(){}' > src/bin/tack-indexer.rs \
     && echo '' > src/lib.rs
 RUN cargo build --release
-# Must also clear the `lib*` artifacts (the crate is both a lib and two bins)
-# and the .fingerprint dirs -- rm'ing only the deps/tack_server* binary
-# artifact leaves the stale, empty dummy libtack_server.rlib/.rmeta in place,
-# and Cargo's fingerprint cache then happily links the real binaries against
-# that stale empty lib instead of recompiling it (caught by actually building
-# this image, not just `cargo build` locally against the un-copied source).
+# See Dockerfile's comment: must clear lib* artifacts and .fingerprint too,
+# not just the deps/tack_server*/tack_indexer* binary artifacts.
 RUN rm -rf target/release/deps/*tack_server* target/release/deps/*tack_indexer* \
            target/release/.fingerprint/tack-server-*
 
 # Build real binary
 COPY src ./src
 COPY migrations ./migrations
-RUN cargo build --release
+RUN cargo build --release --bin tack-indexer
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -43,9 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1001 tack
 WORKDIR /app
 
-COPY --from=builder /app/target/release/tack-server ./tack-server
+COPY --from=builder /app/target/release/tack-indexer ./tack-indexer
 
 USER tack
-EXPOSE 8087
 
-CMD ["./tack-server"]
+CMD ["./tack-indexer"]

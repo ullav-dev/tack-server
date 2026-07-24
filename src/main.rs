@@ -10,21 +10,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-mod auth;
-mod config;
-mod db;
-mod error;
 mod handlers;
-mod models;
+
+use tack_server::{auth, config, db, error, models, search, AppState};
 
 use config::Config;
-use db::DbPool;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: DbPool,
-    pub api_validator: ullav_mcp_auth::TokenValidator,
-}
+use search::SearchClient;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -44,6 +35,7 @@ pub struct AppState {
         handlers::notes::create_reply,
         handlers::notes::list_replies,
         handlers::notes::list_revisions,
+        handlers::search::search,
     ),
     components(schemas(
         error::ErrorResponse,
@@ -54,11 +46,13 @@ pub struct AppState {
         models::note::ReplyRequest,
         models::note::UpdateNoteRequest,
         models::note::NoteRevision,
+        search::SearchHit,
     )),
     tags(
         (name = "health", description = "Service health"),
         (name = "me", description = "Caller identity"),
         (name = "notes", description = "Notes: threaded, entity-attached comments"),
+        (name = "search", description = "Cross-content search"),
     ),
 )]
 struct ApiDoc;
@@ -97,6 +91,16 @@ async fn main() -> Result<()> {
     let pool = db::create_pool(&cfg.database_url)?;
     db::run_migrations(&pool).await?;
 
+    // OpenSearch is a secondary, rebuildable index -- Postgres (already
+    // connected above) is the source of truth. A Notes CRUD-only outage in
+    // OpenSearch must not take down the whole API server, so this is a
+    // logged warning, not a startup failure (`GET /search` will simply error
+    // per-request until OpenSearch is reachable).
+    let search_client = SearchClient::new(cfg.opensearch_url.clone());
+    if let Err(e) = search_client.ensure_index().await {
+        tracing::warn!("OpenSearch not reachable at startup, continuing without it: {e:#}");
+    }
+
     let addr: std::net::SocketAddr = cfg.bind_addr().parse()?;
 
     let state = AppState {
@@ -109,6 +113,7 @@ async fn main() -> Result<()> {
             cfg.oauth2_issuer,
             String::new(),
         ),
+        search: search_client,
     };
 
     let app = Router::new()
@@ -127,6 +132,7 @@ async fn main() -> Result<()> {
             post(handlers::notes::create_reply).get(handlers::notes::list_replies),
         )
         .route("/notes/:id/revisions", get(handlers::notes::list_revisions))
+        .route("/search", get(handlers::search::search))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

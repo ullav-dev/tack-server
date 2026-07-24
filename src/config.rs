@@ -7,6 +7,7 @@ pub struct Config {
     pub database_url: String,
     pub oauth2_jwks_url: String,
     pub oauth2_issuer: String,
+    pub opensearch_url: String,
 }
 
 impl Config {
@@ -22,6 +23,8 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8081/oauth2/jwks".into()),
             oauth2_issuer: std::env::var("OAUTH2_ISSUER")
                 .unwrap_or_else(|_| "http://localhost:8081".into()),
+            opensearch_url: std::env::var("OPENSEARCH_URL")
+                .unwrap_or_else(|_| "http://localhost:9200".into()),
         })
     }
 
