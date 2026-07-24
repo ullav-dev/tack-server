@@ -44,8 +44,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "7", features = ["axum"] }
 
-# JWT validation (RS256 via UUM JWKS)
+# JWT validation (RS256 via UUM JWKS) + MCP server
 ullav-mcp-auth = { path = "../ullav-mcp-auth", default-features = false, features = ["axum-07"] }
+rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session", "macros"] }
+schemars = "1.0"
 
 # HTTP client (auth proxy / cross-app reference resolution)
 reqwest = { version = "0.12", features = ["json"] }

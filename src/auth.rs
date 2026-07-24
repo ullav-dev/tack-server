@@ -69,6 +69,53 @@ impl TackUser {
     }
 }
 
+/// Shared "sub/roles/teams -> TackUser" logic, used by both the REST
+/// `FromRequestParts` extractor (general API JWT) and `from_mcp_claims`
+/// (audience-bound MCP token) — same access-gate rules either way.
+fn build_tack_user<'a>(
+    sub: &str,
+    roles: &[String],
+    teams: impl IntoIterator<Item = (&'a String, &'a str, &'a [String], Option<&'a str>)>,
+) -> Result<TackUser, AppError> {
+    let user_id = sub.parse::<Uuid>().map_err(|_| AppError::Unauthorized("Invalid subject in token".into()))?;
+    let is_admin = roles.iter().any(|r| r == "admin");
+
+    let team_map: HashMap<Uuid, TackTeamMembership> = teams
+        .into_iter()
+        .filter(|(_, _, products, _)| products.iter().any(|p| p == "tack"))
+        .filter_map(|(id, role, _, organization_id)| {
+            let team_id = id.parse::<Uuid>().ok()?;
+            Some((
+                team_id,
+                TackTeamMembership {
+                    role: role.to_string(),
+                    organization_id: organization_id.and_then(|s| s.parse().ok()),
+                },
+            ))
+        })
+        .collect();
+
+    if !is_admin && team_map.is_empty() {
+        return Err(AppError::Forbidden(
+            "Your account does not have access to Tack. Ask your team owner to enable Tack for your team.".into(),
+        ));
+    }
+
+    Ok(TackUser { user_id, is_admin, teams: team_map })
+}
+
+/// Builds a `TackUser` from an audience-bound MCP token's claims (see
+/// `ullav_mcp_auth::McpClaims`) — same access-gate rules as the REST
+/// `FromRequestParts` extractor, just sourced from the MCP claims shape
+/// instead of decoding a fresh general-API JWT.
+pub fn from_mcp_claims(claims: &ullav_mcp_auth::McpClaims) -> Result<TackUser, AppError> {
+    build_tack_user(
+        &claims.sub,
+        &claims.roles,
+        claims.teams.iter().map(|(id, t)| (id, t.role.as_str(), t.products.as_slice(), t.organization_id.as_deref())),
+    )
+}
+
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for TackUser
 where
@@ -96,36 +143,11 @@ where
             .await
             .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
 
-        let user_id = claims
-            .sub
-            .parse::<Uuid>()
-            .map_err(|_| AppError::Unauthorized("Invalid subject in token".into()))?;
-
-        let is_admin = claims.roles.iter().any(|r| r == "admin");
-
-        let teams: HashMap<Uuid, TackTeamMembership> = claims
-            .teams
-            .into_iter()
-            .filter(|(_, t)| t.products.iter().any(|p| p == "tack"))
-            .filter_map(|(id, t)| {
-                let team_id = id.parse::<Uuid>().ok()?;
-                Some((
-                    team_id,
-                    TackTeamMembership {
-                        role: t.role,
-                        organization_id: t.organization_id.and_then(|s| s.parse().ok()),
-                    },
-                ))
-            })
-            .collect();
-
-        if !is_admin && teams.is_empty() {
-            return Err(AppError::Forbidden(
-                "Your account does not have access to Tack. Ask your team owner to enable Tack for your team.".into(),
-            ));
-        }
-
-        Ok(TackUser { user_id, is_admin, teams })
+        build_tack_user(
+            &claims.sub,
+            &claims.roles,
+            claims.teams.iter().map(|(id, t)| (id, t.role.as_str(), t.products.as_slice(), t.organization_id.as_deref())),
+        )
     }
 }
 
