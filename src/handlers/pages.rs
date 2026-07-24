@@ -9,7 +9,8 @@ use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::page::{
-    CreatePagePermissionRequest, CreatePageRequest, Page, PagePermission, UpdatePageRequest,
+    CreatePagePermissionRequest, CreatePageRequest, Page, PagePermission, PagePermissionLevelResponse,
+    UpdatePageRequest,
 };
 use crate::pages_acl::{
     can_create_in_space, require_edit, resolve_effective_permission, resolve_space, resolve_visible_page,
@@ -113,6 +114,33 @@ pub async fn get_page(
 ) -> AppResult<Json<Page>> {
     let (page, _space) = resolve_visible_page(&state.db, &user, id).await?;
     Ok(Json(page))
+}
+
+/// The caller's own effective permission level on this page — `view` or
+/// `edit`, resolved by the same live ancestor/space-fallback algorithm as
+/// every other page endpoint. Exists specifically so that `tack-hocuspocus`
+/// (a separate service, in a different language) can delegate ACL
+/// resolution back here rather than reimplementing it in TypeScript; also
+/// useful to the frontend directly (e.g. to render the editor read-only).
+#[utoipa::path(
+    get,
+    path = "/pages/{id}/permission",
+    responses((status = 200, description = "Caller's effective permission level", body = PagePermissionLevelResponse)),
+    tag = "pages"
+)]
+pub async fn get_page_permission(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<PagePermissionLevelResponse>> {
+    let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
+    // `resolve_visible_page` already required at least View access, so
+    // `level` is guaranteed `Some` here -- the `unwrap_or` is defensive,
+    // not a real fallback path.
+    let level = resolve_effective_permission(&state.db, &user, &page, &space)
+        .await?
+        .unwrap_or(crate::models::page::PermissionLevel::View);
+    Ok(Json(PagePermissionLevelResponse { level }))
 }
 
 #[utoipa::path(
