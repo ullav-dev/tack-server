@@ -1,21 +1,41 @@
 use anyhow::Result;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use ullav_mcp_auth::{mcp_auth_middleware, protected_resource_metadata, McpClaims, ProtectedResourceConfig, TokenValidator};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 mod handlers;
+mod mcp;
+mod notes_acl;
 
 use tack_server::{auth, config, db, error, models, search, AppState};
 
 use config::Config;
 use search::SearchClient;
+
+fn host_from_uri(uri: &str) -> &str {
+    let without_scheme = uri.find("://").map(|i| &uri[i + 3..]).unwrap_or(uri);
+    without_scheme.split('/').next().unwrap_or(without_scheme)
+}
+
+/// Gates the MCP endpoint on the `tack:tools` scope — mirrors
+/// ullav-dam-server's `dam_scope_guard`.
+async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<Response, StatusCode> {
+    let claims = req.extensions().get::<McpClaims>().ok_or(StatusCode::UNAUTHORIZED)?;
+    if !claims.scope.split_whitespace().any(|s| s == "tack:tools") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(next.run(req).await)
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -103,6 +123,17 @@ async fn main() -> Result<()> {
 
     let addr: std::net::SocketAddr = cfg.bind_addr().parse()?;
 
+    let mcp_token_validator =
+        TokenValidator::new(cfg.oauth2_jwks_url.clone(), cfg.oauth2_issuer.clone(), cfg.tack_mcp_canonical_uri.clone());
+    let mcp_prc = ProtectedResourceConfig {
+        resource_uri: cfg.tack_mcp_canonical_uri.clone(),
+        authorization_server: cfg.oauth2_issuer.clone(),
+        scopes_supported: vec!["tack:tools".to_owned()],
+        jwks_uri: cfg.oauth2_jwks_url.clone(),
+    };
+    let mcp_service =
+        mcp::make_tack_mcp_service(pool.clone(), search_client.clone(), host_from_uri(&cfg.tack_mcp_canonical_uri));
+
     let state = AppState {
         db: pool,
         // Empty audience — this validates general API bearer tokens (any UUM-issued
@@ -133,6 +164,21 @@ async fn main() -> Result<()> {
         )
         .route("/notes/:id/revisions", get(handlers::notes::list_revisions))
         .route("/search", get(handlers::search::search))
+        // Tack MCP — audience-bound RS256 + tack:tools scope guard.
+        .merge(
+            Router::new()
+                .route_service("/mcp", mcp_service)
+                .layer(middleware::from_fn(tack_scope_guard))
+                .layer(middleware::from_fn(mcp_auth_middleware))
+                .layer(Extension(mcp_token_validator))
+                .layer(Extension(mcp_prc.clone())),
+        )
+        // RFC 9728 protected resource metadata.
+        .merge(
+            Router::new()
+                .route("/.well-known/oauth-protected-resource/mcp", get(protected_resource_metadata))
+                .layer(Extension(mcp_prc)),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

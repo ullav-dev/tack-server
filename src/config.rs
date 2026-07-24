@@ -8,6 +8,10 @@ pub struct Config {
     pub oauth2_jwks_url: String,
     pub oauth2_issuer: String,
     pub opensearch_url: String,
+    /// Canonical public URI of this server's MCP endpoint — used as the
+    /// OAuth2 resource-server audience. Defaults to a local dev URL; must be
+    /// set to the real public URL in any deployed environment.
+    pub tack_mcp_canonical_uri: String,
 }
 
 impl Config {
@@ -25,6 +29,8 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8081".into()),
             opensearch_url: std::env::var("OPENSEARCH_URL")
                 .unwrap_or_else(|_| "http://localhost:9200".into()),
+            tack_mcp_canonical_uri: std::env::var("TACK_MCP_CANONICAL_URI")
+                .unwrap_or_else(|_| "http://localhost:8087/mcp".into()),
         })
     }
 
