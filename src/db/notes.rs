@@ -226,15 +226,20 @@ pub async fn list_replies(pool: &Pool, parent_id: Uuid, organization_id: Uuid) -
     Ok(rows.iter().map(row_to_note).collect())
 }
 
-/// Edits a note's title, body (creating a new revision), and/or visibility.
-/// Caller must already be authorized (creator or admin) — enforced by the handler.
+/// Edits a note's title, body, and/or visibility. Caller must already be
+/// authorized (creator or admin) — enforced by the handler.
+///
+/// Does **not** create a new revision — a revision is a deliberate snapshot
+/// ("this is a version worth being able to come back to"), taken only via
+/// `create_revision` below, not implicitly on every autosave-style edit.
+/// Version 1 is still created automatically at note-creation time (see
+/// `insert_body_and_first_revision`) as a reasonable baseline snapshot.
 pub async fn update_note(
     pool: &Pool,
     note: &Note,
     new_title: Option<&str>,
     new_body: Option<&str>,
     new_visibility: Option<Visibility>,
-    edited_by: Uuid,
 ) -> Result<Note, AppError> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
@@ -251,21 +256,6 @@ pub async fn update_note(
         tx.execute(
             "UPDATE note_bodies SET body_markdown = $1 WHERE note_id = $2 AND organization_id = $3",
             &[&body, &note.id, &note.organization_id],
-        )
-        .await?;
-
-        let version_row = tx
-            .query_one(
-                "SELECT COALESCE(MAX(version), 0) + 1 FROM note_revisions
-                 WHERE note_id = $1 AND organization_id = $2",
-                &[&note.id, &note.organization_id],
-            )
-            .await?;
-        let next_version: i32 = version_row.get(0);
-        tx.execute(
-            "INSERT INTO note_revisions (organization_id, note_id, version, body_markdown, edited_by)
-             VALUES ($1, $2, $3, $4, $5)",
-            &[&note.organization_id, &note.id, &next_version, &body, &edited_by],
         )
         .await?;
     }
@@ -307,6 +297,54 @@ pub async fn soft_delete_note(pool: &Pool, note: &Note) -> Result<(), AppError> 
     enqueue_outbox_event(&tx, note.organization_id, note.id, "deleted").await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Snapshots a note's *current* body as a new named version — a deliberate
+/// action by an authorized user (caller must already be authorized; enforced
+/// by the handler), not something that happens implicitly on every save. The
+/// snapshot is of whatever `note_bodies.body_markdown` holds right now, so
+/// any edits made via `update_note` since the last version become part of
+/// this new one.
+pub async fn create_revision(pool: &Pool, note: &Note, edited_by: Uuid) -> Result<NoteRevision, AppError> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+
+    let body_row = tx
+        .query_one(
+            "SELECT body_markdown FROM note_bodies WHERE note_id = $1 AND organization_id = $2",
+            &[&note.id, &note.organization_id],
+        )
+        .await?;
+    let body_markdown: String = body_row.get(0);
+
+    let version_row = tx
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM note_revisions
+             WHERE note_id = $1 AND organization_id = $2",
+            &[&note.id, &note.organization_id],
+        )
+        .await?;
+    let next_version: i32 = version_row.get(0);
+
+    let row = tx
+        .query_one(
+            "INSERT INTO note_revisions (organization_id, note_id, version, body_markdown, edited_by)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, note_id, version, body_markdown, edited_by, edited_at",
+            &[&note.organization_id, &note.id, &next_version, &body_markdown, &edited_by],
+        )
+        .await?;
+
+    tx.commit().await?;
+
+    Ok(NoteRevision {
+        id: row.get("id"),
+        note_id: row.get("note_id"),
+        version: row.get("version"),
+        body_markdown: row.get("body_markdown"),
+        edited_by: row.get("edited_by"),
+        edited_at: row.get("edited_at"),
+    })
 }
 
 pub async fn list_revisions(
