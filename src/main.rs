@@ -16,6 +16,7 @@ use utoipa_swagger_ui::SwaggerUi;
 mod handlers;
 mod mcp;
 mod notes_acl;
+mod pages_acl;
 
 use tack_server::{auth, config, db, embeddings, error, models, search, AppState};
 
@@ -56,6 +57,16 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::notes::list_replies,
         handlers::notes::list_revisions,
         handlers::search::search,
+        handlers::spaces::create_space,
+        handlers::spaces::list_spaces,
+        handlers::pages::create_page,
+        handlers::pages::list_pages,
+        handlers::pages::get_page,
+        handlers::pages::update_page,
+        handlers::pages::delete_page,
+        handlers::pages::list_page_permissions,
+        handlers::pages::create_page_permission,
+        handlers::pages::delete_page_permission,
     ),
     components(schemas(
         error::ErrorResponse,
@@ -67,12 +78,22 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::note::UpdateNoteRequest,
         models::note::NoteRevision,
         search::SearchHit,
+        models::page::Space,
+        models::page::CreateSpaceRequest,
+        models::page::Page,
+        models::page::CreatePageRequest,
+        models::page::UpdatePageRequest,
+        models::page::PagePermission,
+        models::page::CreatePagePermissionRequest,
+        models::page::PermissionLevel,
+        models::page::PrincipalType,
     )),
     tags(
         (name = "health", description = "Service health"),
         (name = "me", description = "Caller identity"),
         (name = "notes", description = "Notes: threaded, entity-attached comments"),
         (name = "search", description = "Cross-content search"),
+        (name = "pages", description = "Pages: hierarchical documents organized into spaces"),
     ),
 )]
 struct ApiDoc;
@@ -188,6 +209,18 @@ async fn main() -> Result<()> {
         )
         .route("/notes/:id/revisions", get(handlers::notes::list_revisions))
         .route("/search", get(handlers::search::search))
+        .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
+        .route("/spaces/:id/pages", get(handlers::pages::list_pages))
+        .route("/pages", post(handlers::pages::create_page))
+        .route(
+            "/pages/:id",
+            get(handlers::pages::get_page).patch(handlers::pages::update_page).delete(handlers::pages::delete_page),
+        )
+        .route(
+            "/pages/:id/permissions",
+            post(handlers::pages::create_page_permission).get(handlers::pages::list_page_permissions),
+        )
+        .route("/pages/:id/permissions/:permission_id", axum::routing::delete(handlers::pages::delete_page_permission))
         // Tack MCP — audience-bound RS256 + tack:tools scope guard.
         .merge(
             Router::new()
