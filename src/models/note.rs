@@ -49,6 +49,12 @@ pub struct Note {
     /// Number of direct replies — derived, returned by list/get endpoints so
     /// the UI can show a badge without a separate fetch.
     pub reply_count: i64,
+    /// For a reply, the parent note's latest saved version number at the
+    /// moment this reply was created -- lets the UI show a reply only while
+    /// browsing that version (or the current state, if it's still the
+    /// latest). `None` for top-level notes, and for replies created before
+    /// this field existed.
+    pub in_reply_to_version: Option<i32>,
 }
 
 /// A page of top-level notes for a team, oldest-first pagination via
@@ -83,7 +89,8 @@ pub struct ReplyRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateNoteRequest {
-    /// Presence of this field creates a new revision.
+    /// Does NOT create a new revision -- see `POST /notes/{id}/revisions`
+    /// for that, which is a separate, explicit action.
     pub body_markdown: Option<String>,
     pub visibility: Option<Visibility>,
     /// Not versioned in `note_revisions` (only `body_markdown` is) -- title

@@ -224,3 +224,25 @@ pub async fn create_revision(
     Ok(Json(revision))
 }
 
+/// Deletes one saved version. Refuses to delete the last remaining one (see
+/// `db::notes::delete_revision`) — a note must always have at least a
+/// baseline snapshot.
+#[utoipa::path(
+    delete,
+    path = "/notes/{id}/revisions/{revision_id}",
+    responses((status = 204, description = "Version deleted")),
+    tag = "notes"
+)]
+pub async fn delete_revision(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path((id, revision_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<axum::http::StatusCode> {
+    let note = resolve_visible_note(&state.db, &user, id).await?;
+    if !can_edit(&note, &user) {
+        return Err(AppError::Forbidden("Only the creator or an admin can delete a version of this note.".into()));
+    }
+    db::notes::delete_revision(&state.db, &note, revision_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+

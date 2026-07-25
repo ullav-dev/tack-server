@@ -57,6 +57,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::notes::list_replies,
         handlers::notes::list_revisions,
         handlers::notes::create_revision,
+        handlers::notes::delete_revision,
         handlers::search::search,
         handlers::spaces::create_space,
         handlers::spaces::list_spaces,
@@ -215,6 +216,7 @@ async fn main() -> Result<()> {
             "/notes/:id/revisions",
             get(handlers::notes::list_revisions).post(handlers::notes::create_revision),
         )
+        .route("/notes/:id/revisions/:revision_id", axum::routing::delete(handlers::notes::delete_revision))
         .route("/search", get(handlers::search::search))
         .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
         .route("/spaces/:id/pages", get(handlers::pages::list_pages))
