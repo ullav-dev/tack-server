@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::embeddings::{chunk_text, Embedder, EMBEDDING_DIMENSION, EMBEDDING_VERSION};
 use crate::models::note::{Note, Visibility};
+use crate::models::page::Page;
 
 pub const CONTENT_INDEX: &str = "tack-content";
 
@@ -160,6 +161,81 @@ impl SearchClient {
         Ok(())
     }
 
+    /// Indexes (or re-indexes) a page's `content_markdown`, chunked the same
+    /// way as a note's body. Unlike Notes, Page ACL can't be reduced to a
+    /// static field the OpenSearch query itself can filter on (permission is
+    /// resolved live from the page/space tree, see `pages_acl.rs`) — the
+    /// `acl_filter` below only applies a coarse "belongs to one of the
+    /// caller's organizations" pre-filter; the real per-page visibility
+    /// check happens as a live post-filter in `handlers::search::search`,
+    /// the same live-recheck idiom already used by `handlers::pages::search_pages`.
+    pub async fn index_page(&self, page: &Page, embedder: Option<&Embedder>) -> Result<()> {
+        let chunks = chunk_text(&page.content_markdown);
+        let embeddings: Vec<Option<Vec<f32>>> = if let Some(embedder) = embedder {
+            let texts: Vec<String> = chunks.iter().map(|(_, t)| t.clone()).collect();
+            match embedder.embed_passages(texts).await {
+                Ok(vectors) => vectors.into_iter().map(Some).collect(),
+                Err(e) => {
+                    tracing::warn!("embedding failed for page {}, indexing lexical-only: {e:#}", page.id);
+                    vec![None; chunks.len()]
+                }
+            }
+        } else {
+            vec![None; chunks.len()]
+        };
+
+        for ((chunk_index, chunk_text), embedding) in chunks.into_iter().zip(embeddings) {
+            let doc_id = format!("page:{}:{chunk_index}", page.id);
+            let url = format!("{}/{CONTENT_INDEX}/_doc/{doc_id}", self.base_url);
+            let mut doc = json!({
+                "content_id": page.id,
+                "content_type": "page",
+                "source": "body",
+                "organization_id": page.organization_id,
+                "created_by": page.created_by,
+                "language": "en",
+                "text": chunk_text,
+                "chunk_index": chunk_index,
+                "created_at": page.created_at.to_rfc3339(),
+                "updated_at": page.updated_at.to_rfc3339(),
+            });
+            if let Some(vector) = embedding {
+                doc["embedding"] = json!(vector);
+                doc["embedding_version"] = json!(EMBEDDING_VERSION);
+            }
+            let resp = self.http.put(&url).json(&doc).send().await.context("indexing request failed")?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("failed to index {doc_id}: {body}");
+            }
+        }
+        // A page with no content yet (chunk_text("") produces zero chunks)
+        // still needs any *previously* indexed chunks removed -- e.g. the
+        // page was edited down to empty. Cheap and idempotent either way.
+        if page.content_markdown.trim().is_empty() {
+            self.delete_page(page.id).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes all of a page's chunk documents (soft-delete in Postgres ->
+    /// hard removal from search).
+    pub async fn delete_page(&self, page_id: Uuid) -> Result<()> {
+        let url = format!("{}/{CONTENT_INDEX}/_delete_by_query", self.base_url);
+        let query = json!({
+            "query": { "bool": { "must": [
+                { "term": { "content_type": "page" } },
+                { "term": { "content_id": page_id } }
+            ]}}
+        });
+        let resp = self.http.post(&url).json(&query).send().await.context("delete request failed")?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("failed to delete page {page_id}: {body}");
+        }
+        Ok(())
+    }
+
     /// Hybrid search: lexical (BM25) + semantic (kNN, when an embedder is
     /// available), combined via Reciprocal Rank Fusion rather than trying to
     /// normalize two incomparable score scales. ACL is enforced *in* both
@@ -288,6 +364,20 @@ impl SearchCaller {
                     ]
                 }
             }));
+            // Coarse pre-filter only -- "any page belonging to one of the
+            // caller's organizations". The real per-page permission check
+            // (ancestor overrides, space membership) happens as a live
+            // post-filter in handlers::search::search, since it can't be
+            // expressed as a static OpenSearch query the way Notes'
+            // visibility enum can.
+            should.push(json!({
+                "bool": {
+                    "must": [
+                        { "term": { "content_type": "page" } },
+                        { "terms": { "organization_id": self.organization_ids } }
+                    ]
+                }
+            }));
         }
         Some(json!({ "bool": { "should": should, "minimum_should_match": 1 } }))
     }
@@ -350,10 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn non_admin_with_teams_and_orgs_gets_all_three_should_clauses() {
+    fn non_admin_with_teams_and_orgs_gets_all_four_should_clauses() {
         let filter = caller(false, vec![Uuid::new_v4()], vec![Uuid::new_v4()]).acl_filter().unwrap();
         let should = filter["bool"]["should"].as_array().unwrap();
-        assert_eq!(should.len(), 3, "created_by + team clause + organization clause");
+        assert_eq!(
+            should.len(),
+            4,
+            "created_by + team clause + organization clause + page-organization-membership clause"
+        );
+    }
+
+    #[test]
+    fn organization_member_gets_a_coarse_page_should_clause() {
+        let org_id = Uuid::new_v4();
+        let filter = caller(false, vec![], vec![org_id]).acl_filter().unwrap();
+        let should = filter["bool"]["should"].as_array().unwrap();
+        let page_clause = &should[2];
+        assert_eq!(page_clause["bool"]["must"][0]["term"]["content_type"], "page");
+        assert_eq!(page_clause["bool"]["must"][1]["terms"]["organization_id"][0], org_id.to_string());
     }
 
     #[test]

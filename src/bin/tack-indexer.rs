@@ -144,17 +144,31 @@ async fn apply_event(
     event: &OutboxEvent,
     embedder: Option<&Embedder>,
 ) -> Result<()> {
-    if event.content_type != "note" {
-        // Pages don't exist yet -- nothing to do, not an error.
-        return Ok(());
-    }
-    if event.event_type == "deleted" {
-        return search.delete_note(event.content_id).await;
-    }
-    match db::notes::get_note(pool, event.content_id, event.organization_id).await {
-        Ok(Some(note)) => search.index_note(&note, embedder).await,
-        // Soft-deleted or otherwise gone by the time we got to it -- nothing to index.
-        Ok(None) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!(e)),
+    match event.content_type.as_str() {
+        "note" => {
+            if event.event_type == "deleted" {
+                return search.delete_note(event.content_id).await;
+            }
+            match db::notes::get_note(pool, event.content_id, event.organization_id).await {
+                Ok(Some(note)) => search.index_note(&note, embedder).await,
+                // Soft-deleted or otherwise gone by the time we got to it -- nothing to index.
+                Ok(None) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        }
+        "page" => {
+            if event.event_type == "deleted" {
+                return search.delete_page(event.content_id).await;
+            }
+            match db::pages::get_page(pool, event.content_id, event.organization_id).await {
+                Ok(Some(page)) => search.index_page(&page, embedder).await,
+                Ok(None) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        }
+        other => {
+            tracing::warn!("unrecognized outbox content_type {other:?}, skipping");
+            Ok(())
+        }
     }
 }
