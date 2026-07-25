@@ -368,12 +368,14 @@ pub async fn create_revision(pool: &Pool, note: &Note, edited_by: Uuid) -> Resul
 /// against (both as a baseline snapshot and as the fallback
 /// `in_reply_to_version` for replies made before any explicit save).
 ///
-/// Known gap, deliberately not solved here: a reply tagged to the deleted
-/// version's number stays tagged to that number — if no other revision
-/// shares it, that reply becomes unreachable from history browsing (though
-/// it still shows up under "current" if its number happens to match
-/// whatever the new latest version is). Reassigning orphaned replies to the
-/// nearest surviving version is a reasonable follow-up, not done yet.
+/// Any reply tagged with the deleted version's number is reassigned to the
+/// nearest surviving version -- preferring the nearest *lower* one (the
+/// reply was made while that version's body was live, so the closest
+/// still-existing snapshot from before this deletion is the most accurate
+/// remaining context), falling back to the nearest higher one if the
+/// deleted version was the oldest surviving one. Without this, those
+/// replies would become permanently unreachable from history browsing —
+/// orphaned rows that just accumulate as noise.
 pub async fn delete_revision(
     pool: &Pool,
     note: &Note,
@@ -393,15 +395,42 @@ pub async fn delete_revision(
         return Err(AppError::BadRequest("Can't delete the only remaining version.".into()));
     }
 
-    let deleted = tx
-        .execute(
-            "DELETE FROM note_revisions WHERE id = $1 AND note_id = $2 AND organization_id = $3",
+    let target_row = tx
+        .query_opt(
+            "SELECT version FROM note_revisions WHERE id = $1 AND note_id = $2 AND organization_id = $3",
             &[&revision_id, &note.id, &note.organization_id],
         )
         .await?;
-    if deleted == 0 {
+    let Some(target_row) = target_row else {
         return Err(AppError::NotFound("Version not found.".into()));
-    }
+    };
+    let target_version: i32 = target_row.get(0);
+
+    let reassign_row = tx
+        .query_one(
+            "SELECT COALESCE(
+                (SELECT MAX(version) FROM note_revisions
+                 WHERE note_id = $1 AND organization_id = $2 AND version < $3),
+                (SELECT MIN(version) FROM note_revisions
+                 WHERE note_id = $1 AND organization_id = $2 AND version > $3)
+             )",
+            &[&note.id, &note.organization_id, &target_version],
+        )
+        .await?;
+    let reassign_to: i32 = reassign_row.get(0);
+
+    tx.execute(
+        "UPDATE notes SET in_reply_to_version = $1
+         WHERE parent_id = $2 AND organization_id = $3 AND in_reply_to_version = $4",
+        &[&reassign_to, &note.id, &note.organization_id, &target_version],
+    )
+    .await?;
+
+    tx.execute(
+        "DELETE FROM note_revisions WHERE id = $1 AND note_id = $2 AND organization_id = $3",
+        &[&revision_id, &note.id, &note.organization_id],
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(())
