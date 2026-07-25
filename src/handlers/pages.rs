@@ -9,7 +9,7 @@ use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::page::{
-    CreatePagePermissionRequest, CreatePageRequest, Page, PagePermission, PagePermissionLevelResponse,
+    CreatePagePermissionRequest, CreatePageRequest, Page, PagePermission, PagePermissionLevelResponse, PageRevision,
     UpdatePageRequest,
 };
 use crate::pages_acl::{
@@ -246,5 +246,58 @@ pub async fn delete_page_permission(
     let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
     require_edit(&state.db, &user, &page, &space).await?;
     db::pages::delete_permission(&state.db, permission_id, page.organization_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/pages/{id}/revisions",
+    responses((status = 200, description = "Revision history, newest first", body = [PageRevision])),
+    tag = "pages"
+)]
+pub async fn list_page_revisions(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<PageRevision>>> {
+    let (page, _space) = resolve_visible_page(&state.db, &user, id).await?;
+    let revisions = db::pages::list_page_revisions(&state.db, page.id, page.organization_id).await?;
+    Ok(Json(revisions))
+}
+
+/// Snapshots the page's current `content_markdown` as a new named version —
+/// a deliberate action, not an automatic side effect of every autosave-style
+/// collaborative edit (see `db::pages::create_page_revision`).
+#[utoipa::path(
+    post,
+    path = "/pages/{id}/revisions",
+    responses((status = 201, description = "New version created", body = PageRevision)),
+    tag = "pages"
+)]
+pub async fn create_page_revision(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<PageRevision>> {
+    let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
+    require_edit(&state.db, &user, &page, &space).await?;
+    let revision = db::pages::create_page_revision(&state.db, &page, user.user_id).await?;
+    Ok(Json(revision))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/pages/{id}/revisions/{revision_id}",
+    responses((status = 204, description = "Version deleted")),
+    tag = "pages"
+)]
+pub async fn delete_page_revision(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path((id, revision_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<axum::http::StatusCode> {
+    let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
+    require_edit(&state.db, &user, &page, &space).await?;
+    db::pages::delete_page_revision(&state.db, &page, revision_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
