@@ -4,7 +4,7 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::models::page::{Page, PagePermission, PermissionLevel, PrincipalType};
+use crate::models::page::{Page, PagePermission, PageRevision, PermissionLevel, PrincipalType};
 
 /// UUID encoded as a 32-char lowercase hex string with no hyphens — the only
 /// UUID form that's a valid ltree label. Same trick as notes::ltree_label.
@@ -195,6 +195,99 @@ pub async fn soft_delete_page(pool: &Pool, page: &Page) -> Result<(), AppError> 
     enqueue_outbox_event(&tx, page.organization_id, page.id, "deleted").await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Snapshots a page's *current* `content_markdown` as a new named version —
+/// a deliberate action by an authorized user (caller must already be
+/// authorized; enforced by the handler), not something that happens
+/// implicitly on every save. Mirrors `db::notes::create_revision` exactly,
+/// except there's no "first revision at creation time" baseline the way
+/// Notes gets one automatically -- a page has zero revisions until someone
+/// explicitly saves one.
+pub async fn create_page_revision(pool: &Pool, page: &Page, edited_by: Uuid) -> Result<PageRevision, AppError> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+
+    let content_row = tx
+        .query_one(
+            "SELECT content_markdown FROM page_docs WHERE page_id = $1 AND organization_id = $2",
+            &[&page.id, &page.organization_id],
+        )
+        .await?;
+    let content_markdown: String = content_row.get(0);
+
+    let version_row = tx
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM page_revisions
+             WHERE page_id = $1 AND organization_id = $2",
+            &[&page.id, &page.organization_id],
+        )
+        .await?;
+    let next_version: i32 = version_row.get(0);
+
+    let row = tx
+        .query_one(
+            "INSERT INTO page_revisions (organization_id, page_id, version, content_markdown, edited_by)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, page_id, version, content_markdown, edited_by, edited_at",
+            &[&page.organization_id, &page.id, &next_version, &content_markdown, &edited_by],
+        )
+        .await?;
+
+    tx.commit().await?;
+
+    Ok(PageRevision {
+        id: row.get("id"),
+        page_id: row.get("page_id"),
+        version: row.get("version"),
+        content_markdown: row.get("content_markdown"),
+        edited_by: row.get("edited_by"),
+        edited_at: row.get("edited_at"),
+    })
+}
+
+/// Deletes a single saved page version. Caller must already be authorized
+/// (creator or admin) — enforced by the handler. Unlike
+/// `db::notes::delete_revision`, there's no "last remaining version" guard
+/// needed for the same reason there's no reply-reassignment step: Pages
+/// have no automatic baseline revision at creation time, so a page can
+/// validly have zero revisions (before anyone ever saves one) -- deleting
+/// down to zero is not a special case to guard against.
+pub async fn delete_page_revision(pool: &Pool, page: &Page, revision_id: Uuid) -> Result<(), AppError> {
+    let client = pool.get().await?;
+    let deleted = client
+        .execute(
+            "DELETE FROM page_revisions WHERE id = $1 AND page_id = $2 AND organization_id = $3",
+            &[&revision_id, &page.id, &page.organization_id],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound("Version not found.".into()));
+    }
+    Ok(())
+}
+
+pub async fn list_page_revisions(pool: &Pool, page_id: Uuid, organization_id: Uuid) -> Result<Vec<PageRevision>, AppError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT id, page_id, version, content_markdown, edited_by, edited_at
+             FROM page_revisions WHERE page_id = $1 AND organization_id = $2
+             ORDER BY version DESC",
+            &[&page_id, &organization_id],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| PageRevision {
+            id: r.get("id"),
+            page_id: r.get("page_id"),
+            version: r.get("version"),
+            content_markdown: r.get("content_markdown"),
+            edited_by: r.get("edited_by"),
+            edited_at: r.get("edited_at"),
+        })
+        .collect())
 }
 
 async fn enqueue_outbox_event(

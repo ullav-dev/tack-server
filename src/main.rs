@@ -70,6 +70,9 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::pages::list_page_permissions,
         handlers::pages::create_page_permission,
         handlers::pages::delete_page_permission,
+        handlers::pages::list_page_revisions,
+        handlers::pages::create_page_revision,
+        handlers::pages::delete_page_revision,
     ),
     components(schemas(
         error::ErrorResponse,
@@ -92,6 +95,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::page::CreatePagePermissionRequest,
         models::page::PermissionLevel,
         models::page::PrincipalType,
+        models::page::PageRevision,
     )),
     tags(
         (name = "health", description = "Service health"),
@@ -231,6 +235,11 @@ async fn main() -> Result<()> {
             post(handlers::pages::create_page_permission).get(handlers::pages::list_page_permissions),
         )
         .route("/pages/:id/permissions/:permission_id", axum::routing::delete(handlers::pages::delete_page_permission))
+        .route(
+            "/pages/:id/revisions",
+            get(handlers::pages::list_page_revisions).post(handlers::pages::create_page_revision),
+        )
+        .route("/pages/:id/revisions/:revision_id", axum::routing::delete(handlers::pages::delete_page_revision))
         // Tack MCP — audience-bound RS256 + tack:tools scope guard.
         .merge(
             Router::new()

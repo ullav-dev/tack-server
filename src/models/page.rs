@@ -142,3 +142,19 @@ pub struct CreatePagePermissionRequest {
     pub principal_id: Option<Uuid>,
     pub level: PermissionLevel,
 }
+
+/// A named, user-triggered snapshot of a page's content (implementation
+/// sequencing step 8c) — same shape and same explicit-only trigger model as
+/// `NoteRevision`. Stores `content_markdown` (kept accurate by
+/// tack-hocuspocus's `onStoreDocument`, not this table's own concern) rather
+/// than a Yjs binary snapshot: simple, human-readable, view-only history —
+/// no "restore this version into the live Yjs doc" feature, matching Notes.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PageRevision {
+    pub id: Uuid,
+    pub page_id: Uuid,
+    pub version: i32,
+    pub content_markdown: String,
+    pub edited_by: Uuid,
+    pub edited_at: DateTime<Utc>,
+}
