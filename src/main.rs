@@ -73,6 +73,11 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::pages::list_page_revisions,
         handlers::pages::create_page_revision,
         handlers::pages::delete_page_revision,
+        handlers::pages::search_pages,
+        handlers::pages::create_page_reference,
+        handlers::pages::list_page_references,
+        handlers::pages::list_page_backlinks,
+        handlers::pages::delete_page_reference,
     ),
     components(schemas(
         error::ErrorResponse,
@@ -96,6 +101,9 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::page::PermissionLevel,
         models::page::PrincipalType,
         models::page::PageRevision,
+        models::page::PageReference,
+        models::page::PageBacklink,
+        models::page::CreatePageReferenceRequest,
     )),
     tags(
         (name = "health", description = "Service health"),
@@ -225,6 +233,7 @@ async fn main() -> Result<()> {
         .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
         .route("/spaces/:id/pages", get(handlers::pages::list_pages))
         .route("/pages", post(handlers::pages::create_page))
+        .route("/pages/search", get(handlers::pages::search_pages))
         .route(
             "/pages/:id",
             get(handlers::pages::get_page).patch(handlers::pages::update_page).delete(handlers::pages::delete_page),
@@ -240,6 +249,12 @@ async fn main() -> Result<()> {
             get(handlers::pages::list_page_revisions).post(handlers::pages::create_page_revision),
         )
         .route("/pages/:id/revisions/:revision_id", axum::routing::delete(handlers::pages::delete_page_revision))
+        .route(
+            "/pages/:id/references",
+            get(handlers::pages::list_page_references).post(handlers::pages::create_page_reference),
+        )
+        .route("/pages/:id/references/:reference_id", axum::routing::delete(handlers::pages::delete_page_reference))
+        .route("/pages/:id/backlinks", get(handlers::pages::list_page_backlinks))
         // Tack MCP — audience-bound RS256 + tack:tools scope guard.
         .merge(
             Router::new()

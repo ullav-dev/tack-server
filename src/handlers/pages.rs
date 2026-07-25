@@ -9,11 +9,11 @@ use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::page::{
-    CreatePagePermissionRequest, CreatePageRequest, Page, PagePermission, PagePermissionLevelResponse, PageRevision,
-    UpdatePageRequest,
+    CreatePageReferenceRequest, CreatePagePermissionRequest, CreatePageRequest, Page, PageBacklink, PagePermission,
+    PagePermissionLevelResponse, PageReference, PageRevision, UpdatePageRequest,
 };
 use crate::pages_acl::{
-    can_create_in_space, require_edit, resolve_effective_permission, resolve_space, resolve_visible_page,
+    can_create_in_space, can_view, require_edit, resolve_effective_permission, resolve_space, resolve_visible_page,
 };
 use crate::AppState;
 
@@ -299,5 +299,175 @@ pub async fn delete_page_revision(
     let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
     require_edit(&state.db, &user, &page, &space).await?;
     db::pages::delete_page_revision(&state.db, &page, revision_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchPagesQuery {
+    /// Used only to resolve which organization to search within (and to
+    /// confirm the caller has access to at least this space) -- results
+    /// are not narrowed to this one space. See `db::pages::search_pages`.
+    pub space_id: Uuid,
+    #[serde(default)]
+    pub q: String,
+}
+
+/// Plain title search across an organization's pages, ACL-filtered per
+/// candidate exactly like `list_pages` -- the backing store for the Page
+/// reference picker (F7 8d). Not routed through OpenSearch: Page content
+/// indexing there is a separate, still-pending gap (see CLAUDE.md), and a
+/// title search doesn't need it.
+#[utoipa::path(
+    get,
+    path = "/pages/search",
+    params(
+        ("space_id" = Uuid, Query, description = "Resolves which organization to search; results aren't narrowed to this space"),
+        ("q" = Option<String>, Query, description = "Title substring to search for; omit/empty to list recent pages"),
+    ),
+    responses((status = 200, description = "Visible pages matching the query", body = [Page])),
+    tag = "pages"
+)]
+pub async fn search_pages(
+    State(state): State<AppState>,
+    user: TackUser,
+    Query(query): Query<SearchPagesQuery>,
+) -> AppResult<Json<Vec<Page>>> {
+    let scoping_space = resolve_space(&state.db, &user, query.space_id).await?;
+    let candidates = db::pages::search_pages(&state.db, scoping_space.organization_id, query.q.trim(), 20).await?;
+
+    let mut visible = Vec::with_capacity(candidates.len());
+    for page in candidates {
+        // Candidates can be in a different space than `scoping_space`
+        // (search is org-wide) -- each one's own space governs its
+        // permission resolution, not the one used to scope the search.
+        let Some(page_space) = db::spaces::get_space(&state.db, page.space_id, scoping_space.organization_id).await? else {
+            continue;
+        };
+        let level = resolve_effective_permission(&state.db, &user, &page, &page_space).await?;
+        if can_view(level) {
+            visible.push(page);
+        }
+    }
+    Ok(Json(visible))
+}
+
+/// Resolves a raw `content_references` row's `target_page_id` into a live
+/// title/space, or `None`/`None` if the target no longer exists or the
+/// caller can no longer see it -- a "broken link" the UI can show, not an
+/// error. Shared by both `list_page_references` (resolving the target) and
+/// `list_page_backlinks` (resolving the source, from the caller's
+/// perspective the "other" page either way).
+async fn resolve_other_page(state: &AppState, user: &TackUser, other_page_id: Uuid) -> (Option<String>, Option<Uuid>) {
+    match resolve_visible_page(&state.db, user, other_page_id).await {
+        Ok((page, _space)) => (Some(page.title), Some(page.space_id)),
+        Err(_) => (None, None),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/pages/{id}/references",
+    request_body = CreatePageReferenceRequest,
+    responses((status = 201, description = "Reference created", body = PageReference)),
+    tag = "pages"
+)]
+pub async fn create_page_reference(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreatePageReferenceRequest>,
+) -> AppResult<Json<PageReference>> {
+    let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
+    require_edit(&state.db, &user, &page, &space).await?;
+
+    // Confirms the target actually exists and is visible to the caller --
+    // content_references has no DB-level FK (it's polymorphic, see
+    // migrations/002_content_links.sql), so this is the only thing
+    // stopping a reference to a bogus or inaccessible page id from being
+    // recorded in the first place.
+    let (target, _target_space) = resolve_visible_page(&state.db, &user, body.target_page_id).await?;
+
+    let raw = db::pages::create_page_reference(&state.db, page.organization_id, page.id, target.id).await?;
+    Ok(Json(PageReference {
+        id: raw.id,
+        source_page_id: raw.source_page_id,
+        target_page_id: raw.target_page_id,
+        target_title: Some(target.title),
+        target_space_id: Some(target.space_id),
+        created_at: raw.created_at,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/pages/{id}/references",
+    responses((status = 200, description = "This page's own outgoing references", body = [PageReference])),
+    tag = "pages"
+)]
+pub async fn list_page_references(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<PageReference>>> {
+    let (page, _space) = resolve_visible_page(&state.db, &user, id).await?;
+    let raw = db::pages::list_page_references(&state.db, page.organization_id, page.id).await?;
+
+    let mut resolved = Vec::with_capacity(raw.len());
+    for r in raw {
+        let (target_title, target_space_id) = resolve_other_page(&state, &user, r.target_page_id).await;
+        resolved.push(PageReference {
+            id: r.id,
+            source_page_id: r.source_page_id,
+            target_page_id: r.target_page_id,
+            target_title,
+            target_space_id,
+            created_at: r.created_at,
+        });
+    }
+    Ok(Json(resolved))
+}
+
+#[utoipa::path(
+    get,
+    path = "/pages/{id}/backlinks",
+    responses((status = 200, description = "Pages that reference this one", body = [PageBacklink])),
+    tag = "pages"
+)]
+pub async fn list_page_backlinks(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<PageBacklink>>> {
+    let (page, _space) = resolve_visible_page(&state.db, &user, id).await?;
+    let raw = db::pages::list_page_backlinks(&state.db, page.organization_id, page.id).await?;
+
+    let mut resolved = Vec::with_capacity(raw.len());
+    for r in raw {
+        let (source_title, source_space_id) = resolve_other_page(&state, &user, r.source_page_id).await;
+        resolved.push(PageBacklink {
+            id: r.id,
+            source_page_id: r.source_page_id,
+            source_title,
+            source_space_id,
+            created_at: r.created_at,
+        });
+    }
+    Ok(Json(resolved))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/pages/{id}/references/{reference_id}",
+    responses((status = 204, description = "Reference removed")),
+    tag = "pages"
+)]
+pub async fn delete_page_reference(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path((id, reference_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<axum::http::StatusCode> {
+    let (page, space) = resolve_visible_page(&state.db, &user, id).await?;
+    require_edit(&state.db, &user, &page, &space).await?;
+    db::pages::delete_page_reference(&state.db, page.organization_id, page.id, reference_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

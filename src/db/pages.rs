@@ -136,6 +136,26 @@ pub async fn list_children(
     Ok(rows.iter().map(row_to_page).collect())
 }
 
+/// Plain `ILIKE` title search across all of an organization's pages
+/// (`space_id` is not part of the WHERE clause -- the caller resolves it
+/// only to know which organization to scope to, not to narrow the result
+/// set to one space -- a page reference picker's whole point is letting a
+/// user link to a page in a *different* space than the one they're
+/// currently editing). Not OpenSearch: Page content indexing there is a
+/// documented, separate, still-pending gap (see CLAUDE.md), and a plain
+/// title search is simple enough not to need it -- always exactly in sync
+/// with Postgres, no indexing lag.
+pub async fn search_pages(pool: &Pool, organization_id: Uuid, query: &str, limit: i64) -> Result<Vec<Page>, AppError> {
+    let client = pool.get().await?;
+    let sql = format!(
+        "{PAGE_SELECT} WHERE p.organization_id = $1 AND p.deleted_at IS NULL
+         AND ($2 = '' OR p.title ILIKE '%' || $2 || '%')
+         ORDER BY p.title ASC LIMIT $3"
+    );
+    let rows = client.query(&sql, &[&organization_id, &query, &limit]).await?;
+    Ok(rows.iter().map(row_to_page).collect())
+}
+
 pub async fn update_page(
     pool: &Pool,
     page: &Page,
@@ -288,6 +308,133 @@ pub async fn list_page_revisions(pool: &Pool, page_id: Uuid, organization_id: Uu
             edited_at: r.get("edited_at"),
         })
         .collect())
+}
+
+/// A raw `content_references` row before the target/source page's title has
+/// been resolved -- the handler layer does that (it has ACL context this
+/// db layer doesn't), building the public `PageReference`/`PageBacklink`
+/// response types from these.
+pub struct RawPageReference {
+    pub id: Uuid,
+    pub source_page_id: Uuid,
+    pub target_page_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Records a page-to-page reference. Caller must already be authorized to
+/// edit `source_page` (enforced by the handler) and the target page's
+/// existence/visibility should already be confirmed (also handler-side,
+/// via `resolve_visible_page`) before calling this -- this function itself
+/// doesn't validate `target_page_id` refers to a real page, matching
+/// `content_references`' deliberate lack of a DB-level FK (see
+/// migrations/002_content_links.sql's header comment: the column is
+/// polymorphic and can point at other services' entities entirely).
+pub async fn create_page_reference(
+    pool: &Pool,
+    organization_id: Uuid,
+    source_page_id: Uuid,
+    target_page_id: Uuid,
+) -> Result<RawPageReference, AppError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_one(
+            "INSERT INTO content_references
+                (organization_id, source_content_type, source_content_id, owning_service, entity_type, entity_id, resolved_kind)
+             VALUES ($1, 'page', $2, 'tack', 'page', $3, 'page')
+             RETURNING id, source_content_id, created_at",
+            &[&organization_id, &source_page_id, &target_page_id.to_string()],
+        )
+        .await?;
+    Ok(RawPageReference {
+        id: row.get("id"),
+        source_page_id: row.get("source_content_id"),
+        target_page_id,
+        created_at: row.get("created_at"),
+    })
+}
+
+/// This page's own outgoing references (pages it links to).
+pub async fn list_page_references(
+    pool: &Pool,
+    organization_id: Uuid,
+    source_page_id: Uuid,
+) -> Result<Vec<RawPageReference>, AppError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT id, source_content_id, entity_id, created_at FROM content_references
+             WHERE organization_id = $1 AND source_content_type = 'page' AND source_content_id = $2
+               AND owning_service = 'tack' AND entity_type = 'page'
+             ORDER BY created_at DESC",
+            &[&organization_id, &source_page_id],
+        )
+        .await?;
+    parse_raw_references(rows, |r| (r.get("source_content_id"), r.get::<_, String>("entity_id")))
+}
+
+/// Pages that reference *this* page (the reverse direction) -- the
+/// backlinks graph, from the same rows `list_page_references` reads.
+pub async fn list_page_backlinks(
+    pool: &Pool,
+    organization_id: Uuid,
+    target_page_id: Uuid,
+) -> Result<Vec<RawPageReference>, AppError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT id, source_content_id, entity_id, created_at FROM content_references
+             WHERE organization_id = $1 AND owning_service = 'tack' AND entity_type = 'page'
+               AND entity_id = $2 AND source_content_type = 'page'
+             ORDER BY created_at DESC",
+            &[&organization_id, &target_page_id.to_string()],
+        )
+        .await?;
+    parse_raw_references(rows, |r| (r.get("source_content_id"), r.get::<_, String>("entity_id")))
+}
+
+fn parse_raw_references(
+    rows: Vec<Row>,
+    extract: impl Fn(&Row) -> (Uuid, String),
+) -> Result<Vec<RawPageReference>, AppError> {
+    rows.iter()
+        .map(|r| {
+            let (source_page_id, entity_id) = extract(r);
+            let target_page_id = entity_id
+                .parse::<Uuid>()
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("content_references.entity_id {entity_id} isn't a UUID: {e}")))?;
+            Ok(RawPageReference {
+                id: r.get("id"),
+                source_page_id,
+                target_page_id,
+                created_at: r.get("created_at"),
+            })
+        })
+        .collect()
+}
+
+/// Removes a reference. Caller must already be authorized to edit the
+/// *source* page (enforced by the handler) -- scoping the delete to
+/// `source_page_id` too (not just `id`) means a caller can't delete a
+/// reference row that isn't actually theirs to manage just by guessing its id.
+pub async fn delete_page_reference(
+    pool: &Pool,
+    organization_id: Uuid,
+    source_page_id: Uuid,
+    reference_id: Uuid,
+) -> Result<(), AppError> {
+    let client = pool.get().await?;
+    let deleted = client
+        .execute(
+            "DELETE FROM content_references
+             WHERE id = $1 AND organization_id = $2 AND source_content_id = $3
+               AND source_content_type = 'page' AND owning_service = 'tack' AND entity_type = 'page'",
+            &[&reference_id, &organization_id, &source_page_id],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound("Reference not found.".into()));
+    }
+    Ok(())
 }
 
 async fn enqueue_outbox_event(

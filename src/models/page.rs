@@ -158,3 +158,44 @@ pub struct PageRevision {
     pub edited_by: Uuid,
     pub edited_at: DateTime<Utc>,
 }
+
+/// A page-to-page cross-reference (implementation sequencing step 8d,
+/// scoped to page-to-page only for this pass -- cross-service references,
+/// e.g. to a Togra workflow or Cunav ticket, are deferred: they'd need a
+/// new public resolve endpoint in the owning service, which doesn't exist
+/// yet). Backed by the generic `content_references` table (already present
+/// since migration 002, unused until now) with `owning_service = 'tack'`,
+/// `entity_type = 'page'`, `entity_id = <target page id>`.
+///
+/// Always resolved live at read time (`target_title`/`target_space_id` are
+/// `None` if the target page no longer exists or the caller can no longer
+/// see it -- a "broken link" state the UI can show, not an error) -- never
+/// a denormalized snapshot. This is the direct structural fix for the
+/// Confluence/Jira stale-reference problem the plan calls out.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PageReference {
+    pub id: Uuid,
+    pub source_page_id: Uuid,
+    pub target_page_id: Uuid,
+    pub target_title: Option<String>,
+    pub target_space_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The reverse of `PageReference` -- pages that reference *this* one. Same
+/// underlying `content_references` rows, read from the other direction;
+/// doubles as the backlinks UI, per the plan's original design for this
+/// table ("populated at save time... doubles as the backlinks graph").
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PageBacklink {
+    pub id: Uuid,
+    pub source_page_id: Uuid,
+    pub source_title: Option<String>,
+    pub source_space_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreatePageReferenceRequest {
+    pub target_page_id: Uuid,
+}
