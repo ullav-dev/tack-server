@@ -69,6 +69,17 @@ pub struct NotesPage {
     pub has_more: bool,
 }
 
+/// Attaches a note to an entity owned by another service (e.g. a lagan pull
+/// request, a togra workflow) — backs `content_attachments`. All three
+/// fields are required together: a note is either fully attached or not
+/// attached at all, never partially.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AttachRequest {
+    pub owning_service: String,
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateNoteRequest {
     /// The team to file this note under. Required even for a `private` note —
@@ -80,11 +91,26 @@ pub struct CreateNoteRequest {
     pub visibility: Visibility,
     pub title: String,
     pub body_markdown: String,
+    /// Optionally attaches this note to an external entity (`content_attachments`)
+    /// in the same transaction as its creation, e.g. a lagan pull request's
+    /// discussion thread.
+    #[serde(default)]
+    pub attach: Option<AttachRequest>,
+    /// Backfill-only: lets an admin caller preserve a historical timestamp
+    /// when migrating notes in from another system, instead of always using
+    /// the moment of the API call. Silently ignored for non-admins (falls
+    /// back to `NOW()`) — see `handlers::notes::create_note`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ReplyRequest {
     pub body_markdown: String,
+    /// Same backfill-only, admin-only timestamp override as
+    /// `CreateNoteRequest::created_at`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

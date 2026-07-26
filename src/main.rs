@@ -50,6 +50,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::me::me,
         handlers::notes::create_note,
         handlers::notes::list_notes,
+        handlers::notes::list_notes_by_attachment,
         handlers::notes::get_note,
         handlers::notes::update_note,
         handlers::notes::delete_note,
@@ -85,6 +86,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::note::Note,
         models::note::Visibility,
         models::note::CreateNoteRequest,
+        models::note::AttachRequest,
         models::note::ReplyRequest,
         models::note::UpdateNoteRequest,
         models::note::NoteRevision,
@@ -214,6 +216,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/me", get(handlers::me::me))
         .route("/notes", post(handlers::notes::create_note).get(handlers::notes::list_notes))
+        .route("/notes/by-entity", get(handlers::notes::list_notes_by_attachment))
         .route(
             "/notes/:id",
             get(handlers::notes::get_note)

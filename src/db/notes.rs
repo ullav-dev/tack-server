@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde_json::json;
 use tokio_postgres::Row;
@@ -40,6 +41,14 @@ const NOTE_SELECT: &str = "
     JOIN note_bodies b ON b.note_id = n.id AND b.organization_id = n.organization_id
 ";
 
+/// An external entity to attach a newly created note to, e.g. a lagan pull
+/// request's discussion thread — backs `content_attachments`.
+pub struct NewAttachment {
+    pub owning_service: String,
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
 pub struct NewNote {
     pub organization_id: Uuid,
     pub team_id: Uuid,
@@ -47,20 +56,26 @@ pub struct NewNote {
     pub created_by: Uuid,
     pub title: String,
     pub body_markdown: String,
+    pub attach: Option<NewAttachment>,
+    /// Backfill-only override — see `CreateNoteRequest::created_at`. `None`
+    /// means "now," same as before this field existed.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
-/// Creates a top-level note: the note row, its body, its first revision, and
-/// an outbox event, all in one transaction.
+/// Creates a top-level note: the note row, its body, its first revision, an
+/// optional `content_attachments` row, and an outbox event, all in one
+/// transaction.
 pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
 
     let id = Uuid::new_v4();
     let thread_path = ltree_label(id);
+    let created_at = new.created_at.unwrap_or_else(Utc::now);
 
     tx.execute(
-        "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, title, created_by)
-         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7)",
+        "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, title, created_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7, $8, $8)",
         &[
             &id,
             &new.organization_id,
@@ -69,11 +84,18 @@ pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
             &new.visibility.as_db_str(),
             &new.title,
             &new.created_by,
+            &created_at,
         ],
     )
     .await?;
 
-    insert_body_and_first_revision(&tx, id, new.organization_id, &new.body_markdown, new.created_by).await?;
+    insert_body_and_first_revision(&tx, id, new.organization_id, &new.body_markdown, new.created_by, created_at)
+        .await?;
+
+    if let Some(attach) = &new.attach {
+        insert_attachment(&tx, new.organization_id, id, attach, created_at).await?;
+    }
+
     enqueue_outbox_event(&tx, new.organization_id, id, "created").await?;
 
     tx.commit().await?;
@@ -81,6 +103,48 @@ pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
     get_note(pool, id, new.organization_id).await?.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!("note {id} vanished immediately after insert"))
     })
+}
+
+async fn insert_attachment(
+    tx: &deadpool_postgres::Transaction<'_>,
+    organization_id: Uuid,
+    note_id: Uuid,
+    attach: &NewAttachment,
+    created_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    tx.execute(
+        "INSERT INTO content_attachments (organization_id, content_type, content_id, owning_service, entity_type, entity_id, created_at)
+         VALUES ($1, 'note', $2, $3, $4, $5, $6)",
+        &[&organization_id, &note_id, &attach.owning_service, &attach.entity_type, &attach.entity_id, &created_at],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Top-level notes attached to a specific external entity (e.g. a lagan pull
+/// request's discussion thread), newest-first — mirrors `list_team_notes`'
+/// shape but joined through `content_attachments` instead of filtered by
+/// `team_id`. Replies aren't attached rows themselves (only their parent is)
+/// so callers fetch each note's replies separately via the existing
+/// `list_replies`, same as the top-level/reply split everywhere else in this
+/// API.
+pub async fn list_notes_by_attachment(
+    pool: &Pool,
+    organization_id: Uuid,
+    owning_service: &str,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<Vec<Note>, AppError> {
+    let client = pool.get().await?;
+    let sql = format!(
+        "{NOTE_SELECT}
+         JOIN content_attachments a ON a.content_type = 'note' AND a.content_id = n.id AND a.organization_id = n.organization_id
+         WHERE n.organization_id = $1 AND n.deleted_at IS NULL
+           AND a.owning_service = $2 AND a.entity_type = $3 AND a.entity_id = $4
+         ORDER BY n.created_at ASC"
+    );
+    let rows = client.query(&sql, &[&organization_id, &owning_service, &entity_type, &entity_id]).await?;
+    Ok(rows.iter().map(row_to_note).collect())
 }
 
 /// Creates a reply: inherits organization_id/team_id/visibility from the
@@ -96,11 +160,13 @@ pub async fn create_reply(
     parent: &Note,
     created_by: Uuid,
     body_markdown: &str,
+    created_at: Option<DateTime<Utc>>,
 ) -> Result<Note, AppError> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
 
     let id = Uuid::new_v4();
+    let created_at = created_at.unwrap_or_else(Utc::now);
     let parent_row = tx
         .query_one(
             "SELECT thread_path::text FROM notes WHERE id = $1 AND organization_id = $2",
@@ -120,8 +186,8 @@ pub async fn create_reply(
     let in_reply_to_version: i32 = version_row.get(0);
 
     tx.execute(
-        "INSERT INTO notes (id, organization_id, team_id, thread_path, parent_id, visibility, created_by, in_reply_to_version)
-         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7, $8)",
+        "INSERT INTO notes (id, organization_id, team_id, thread_path, parent_id, visibility, created_by, in_reply_to_version, created_at, updated_at)
+         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7, $8, $9, $9)",
         &[
             &id,
             &parent.organization_id,
@@ -131,11 +197,12 @@ pub async fn create_reply(
             &parent.visibility.as_db_str(),
             &created_by,
             &in_reply_to_version,
+            &created_at,
         ],
     )
     .await?;
 
-    insert_body_and_first_revision(&tx, id, parent.organization_id, body_markdown, created_by).await?;
+    insert_body_and_first_revision(&tx, id, parent.organization_id, body_markdown, created_by, created_at).await?;
     enqueue_outbox_event(&tx, parent.organization_id, id, "created").await?;
 
     tx.commit().await?;
@@ -151,6 +218,7 @@ async fn insert_body_and_first_revision(
     organization_id: Uuid,
     body_markdown: &str,
     edited_by: Uuid,
+    edited_at: DateTime<Utc>,
 ) -> Result<(), AppError> {
     tx.execute(
         "INSERT INTO note_bodies (note_id, organization_id, body_markdown) VALUES ($1, $2, $3)",
@@ -158,9 +226,9 @@ async fn insert_body_and_first_revision(
     )
     .await?;
     tx.execute(
-        "INSERT INTO note_revisions (organization_id, note_id, version, body_markdown, edited_by)
-         VALUES ($1, $2, 1, $3, $4)",
-        &[&organization_id, &note_id, &body_markdown, &edited_by],
+        "INSERT INTO note_revisions (organization_id, note_id, version, body_markdown, edited_by, edited_at)
+         VALUES ($1, $2, 1, $3, $4, $5)",
+        &[&organization_id, &note_id, &body_markdown, &edited_by, &edited_at],
     )
     .await?;
     Ok(())

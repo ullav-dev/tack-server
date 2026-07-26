@@ -31,6 +31,9 @@ pub async fn create_note(
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
     let organization_id = resolve_team_organization(&user, body.team_id)?;
+    // Backfill-only: only an admin caller's created_at override is honored,
+    // so an ordinary API consumer can never backdate a note.
+    let created_at = if user.is_admin { body.created_at } else { None };
     let note = db::notes::create_note(
         &state.db,
         db::notes::NewNote {
@@ -40,10 +43,64 @@ pub async fn create_note(
             created_by: user.user_id,
             title: body.title,
             body_markdown: body.body_markdown,
+            attach: body.attach.map(|a| db::notes::NewAttachment {
+                owning_service: a.owning_service,
+                entity_type: a.entity_type,
+                entity_id: a.entity_id,
+            }),
+            created_at,
         },
     )
     .await?;
     Ok(Json(note))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListNotesByAttachmentQuery {
+    pub owning_service: String,
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
+/// Top-level notes attached to an external entity (e.g. a lagan pull
+/// request's discussion thread), oldest-first — see
+/// `db::notes::list_notes_by_attachment`. Scoped to the caller's own
+/// organizations: since `content_attachments` carries no visibility of its
+/// own, this walks every one of the caller's Tack-enabled-team organizations
+/// and returns the first match — an entity's notes only ever belong to one
+/// organization in practice (an attachment is created once, by whichever
+/// team's note it is), so this isn't a fan-out concern, just a scan over a
+/// typically-small list.
+#[utoipa::path(
+    get,
+    path = "/notes/by-entity",
+    params(
+        ("owning_service" = String, Query, description = "Namespacing service, e.g. \"lagan\""),
+        ("entity_type" = String, Query, description = "e.g. \"pull_request\""),
+        ("entity_id" = String, Query, description = "The external entity's own id"),
+    ),
+    responses((status = 200, description = "Top-level notes attached to this entity, oldest first", body = [Note])),
+    tag = "notes"
+)]
+pub async fn list_notes_by_attachment(
+    State(state): State<AppState>,
+    user: TackUser,
+    Query(query): Query<ListNotesByAttachmentQuery>,
+) -> AppResult<Json<Vec<Note>>> {
+    for organization_id in user.organization_ids() {
+        let notes = db::notes::list_notes_by_attachment(
+            &state.db,
+            organization_id,
+            &query.owning_service,
+            &query.entity_type,
+            &query.entity_id,
+        )
+        .await?;
+        if !notes.is_empty() {
+            return Ok(Json(notes));
+        }
+    }
+    Ok(Json(Vec::new()))
 }
 
 const DEFAULT_NOTES_LIMIT: i64 = 20;
@@ -166,7 +223,8 @@ pub async fn create_reply(
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
     let parent = resolve_visible_note(&state.db, &user, id).await?;
-    let reply = db::notes::create_reply(&state.db, &parent, user.user_id, &body.body_markdown).await?;
+    let created_at = if user.is_admin { body.created_at } else { None };
+    let reply = db::notes::create_reply(&state.db, &parent, user.user_id, &body.body_markdown, created_at).await?;
     Ok(Json(reply))
 }
 
