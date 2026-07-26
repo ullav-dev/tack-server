@@ -8,7 +8,7 @@ on:
       - 'migrations/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'Dockerfile'
+      - 'Dockerfile*'
       - '.github/workflows/**'
   workflow_dispatch:
 
@@ -33,9 +33,20 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  # Both binaries from this crate (tack-server, tack-indexer), each its own
+  # Dockerfile/ghcr.io image/Helm chart -- same pattern as awe-server's
+  # awe-runner/awe-relay/awe-propagator.
   docker:
     needs: test
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binary: tack-server
+            dockerfile: Dockerfile
+          - binary: tack-indexer
+            dockerfile: Dockerfile.indexer
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -56,13 +67,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.PAT_CLASSIC }}
-      - name: Build and push
+      - name: Build and push ${{ matrix.binary }}
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ghcr.io/ullav-dev/tack-server:${{ steps.commit.outputs.short }}
-            ghcr.io/ullav-dev/tack-server:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/ullav-dev/${{ matrix.binary }}:${{ steps.commit.outputs.short }}
+            ghcr.io/ullav-dev/${{ matrix.binary }}:latest
+          cache-from: type=gha,scope=${{ matrix.binary }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.binary }}
