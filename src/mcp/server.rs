@@ -183,6 +183,8 @@ impl TackMcpServer {
                 created_by: user.user_id,
                 title: p.title,
                 body_markdown: p.body_markdown,
+                attach: None,
+                created_at: None,
             },
         )
         .await
@@ -203,7 +205,8 @@ impl TackMcpServer {
         }
         let note_id = parse_uuid(&p.note_id)?;
         let parent = resolve_visible_note(&self.db, &user, note_id).await.map_err(app_err)?;
-        let reply = db::notes::create_reply(&self.db, &parent, user.user_id, &p.body_markdown).await.map_err(app_err)?;
+        let reply =
+            db::notes::create_reply(&self.db, &parent, user.user_id, &p.body_markdown, None).await.map_err(app_err)?;
         Ok(serde_json::to_string_pretty(&reply).unwrap())
     }
 }
