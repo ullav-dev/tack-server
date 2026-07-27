@@ -102,6 +102,14 @@ pub struct CreateNoteRequest {
     /// back to `NOW()`) — see `handlers::notes::create_note`.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    /// Backfill-only: lets an admin caller preserve the original author when
+    /// migrating notes in from another system (e.g. Cartlann's one-time
+    /// `research_notes` import), instead of attributing the note to
+    /// whichever admin/service account is running the import. Silently
+    /// ignored for non-admins (falls back to the caller's own id) — same
+    /// admin-only-override precedent as `created_at`.
+    #[serde(default)]
+    pub created_by: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -111,6 +119,10 @@ pub struct ReplyRequest {
     /// `CreateNoteRequest::created_at`.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    /// Same backfill-only, admin-only author override as
+    /// `CreateNoteRequest::created_by`.
+    #[serde(default)]
+    pub created_by: Option<Uuid>,
 }
 
 /// A single `content_attachments` row belonging to a note, exposed so a

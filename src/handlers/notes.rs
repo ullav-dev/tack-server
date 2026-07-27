@@ -33,16 +33,18 @@ pub async fn create_note(
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
     let organization_id = resolve_team_organization(&user, body.team_id)?;
-    // Backfill-only: only an admin caller's created_at override is honored,
-    // so an ordinary API consumer can never backdate a note.
+    // Backfill-only: only an admin caller's created_at/created_by overrides
+    // are honored, so an ordinary API consumer can never backdate a note or
+    // attribute it to someone else.
     let created_at = if user.is_admin { body.created_at } else { None };
+    let created_by = if user.is_admin { body.created_by.unwrap_or(user.user_id) } else { user.user_id };
     let note = db::notes::create_note(
         &state.db,
         db::notes::NewNote {
             organization_id,
             team_id: body.team_id,
             visibility: body.visibility,
-            created_by: user.user_id,
+            created_by,
             title: body.title,
             body_markdown: body.body_markdown,
             attach: body.attach.map(|a| db::notes::NewAttachment {
@@ -226,7 +228,8 @@ pub async fn create_reply(
     }
     let parent = resolve_visible_note(&state.db, &user, id).await?;
     let created_at = if user.is_admin { body.created_at } else { None };
-    let reply = db::notes::create_reply(&state.db, &parent, user.user_id, &body.body_markdown, created_at).await?;
+    let created_by = if user.is_admin { body.created_by.unwrap_or(user.user_id) } else { user.user_id };
+    let reply = db::notes::create_reply(&state.db, &parent, created_by, &body.body_markdown, created_at).await?;
     Ok(Json(reply))
 }
 
