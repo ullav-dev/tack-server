@@ -113,6 +113,20 @@ pub struct ReplyRequest {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// A single `content_attachments` row belonging to a note, exposed so a
+/// caller (e.g. Cartlann, linking a note to several of its own objects) can
+/// attach/detach/list entities on a note any time after creation -- not just
+/// the single fixed `attach` `CreateNoteRequest` supports at creation time.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NoteAttachment {
+    pub id: Uuid,
+    pub note_id: Uuid,
+    pub owning_service: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateNoteRequest {
     /// Does NOT create a new revision -- see `POST /notes/{id}/revisions`

@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::note::{CreateNoteRequest, Note, NoteRevision, NotesPage, ReplyRequest, UpdateNoteRequest};
+use crate::models::note::{
+    AttachRequest, CreateNoteRequest, Note, NoteAttachment, NoteRevision, NotesPage, ReplyRequest, UpdateNoteRequest,
+};
 use crate::notes_acl::{can_edit, resolve_team_organization, resolve_visible_note};
 use crate::AppState;
 
@@ -242,6 +244,77 @@ pub async fn list_replies(
     let parent = resolve_visible_note(&state.db, &user, id).await?;
     let replies = db::notes::list_replies(&state.db, parent.id, parent.organization_id).await?;
     Ok(Json(replies))
+}
+
+/// Attaches an already-created note to another entity, e.g. linking one
+/// Cartlann research note to a second collection object. Additive to
+/// `CreateNoteRequest.attach` (which only ever creates one attachment, at
+/// creation time) -- this is how a note ends up linked to *several* entities,
+/// or linked to one after the fact.
+#[utoipa::path(
+    post,
+    path = "/notes/{id}/attachments",
+    request_body = AttachRequest,
+    responses((status = 201, description = "Attachment created", body = NoteAttachment)),
+    tag = "notes"
+)]
+pub async fn create_attachment(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AttachRequest>,
+) -> AppResult<Json<NoteAttachment>> {
+    let note = resolve_visible_note(&state.db, &user, id).await?;
+    if !can_edit(&note, &user) {
+        return Err(AppError::Forbidden("Only the creator or an admin can attach entities to this note.".into()));
+    }
+    let attachment = db::notes::attach_note(
+        &state.db,
+        note.organization_id,
+        note.id,
+        &db::notes::NewAttachment {
+            owning_service: body.owning_service,
+            entity_type: body.entity_type,
+            entity_id: body.entity_id,
+        },
+    )
+    .await?;
+    Ok(Json(attachment))
+}
+
+#[utoipa::path(
+    get,
+    path = "/notes/{id}/attachments",
+    responses((status = 200, description = "This note's own attachments", body = [NoteAttachment])),
+    tag = "notes"
+)]
+pub async fn list_attachments(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<NoteAttachment>>> {
+    let note = resolve_visible_note(&state.db, &user, id).await?;
+    let attachments = db::notes::list_note_attachments(&state.db, note.organization_id, note.id).await?;
+    Ok(Json(attachments))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/notes/{id}/attachments/{attachment_id}",
+    responses((status = 204, description = "Attachment removed")),
+    tag = "notes"
+)]
+pub async fn delete_attachment(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path((id, attachment_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<axum::http::StatusCode> {
+    let note = resolve_visible_note(&state.db, &user, id).await?;
+    if !can_edit(&note, &user) {
+        return Err(AppError::Forbidden("Only the creator or an admin can detach entities from this note.".into()));
+    }
+    db::notes::delete_note_attachment(&state.db, note.organization_id, note.id, attachment_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
