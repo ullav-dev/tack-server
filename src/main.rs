@@ -56,6 +56,9 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::notes::delete_note,
         handlers::notes::create_reply,
         handlers::notes::list_replies,
+        handlers::notes::create_attachment,
+        handlers::notes::list_attachments,
+        handlers::notes::delete_attachment,
         handlers::notes::list_revisions,
         handlers::notes::create_revision,
         handlers::notes::delete_revision,
@@ -91,6 +94,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::note::UpdateNoteRequest,
         models::note::NoteRevision,
         models::note::NotesPage,
+        models::note::NoteAttachment,
         search::SearchHit,
         models::page::Space,
         models::page::CreateSpaceRequest,
@@ -227,6 +231,11 @@ async fn main() -> Result<()> {
             "/notes/:id/replies",
             post(handlers::notes::create_reply).get(handlers::notes::list_replies),
         )
+        .route(
+            "/notes/:id/attachments",
+            post(handlers::notes::create_attachment).get(handlers::notes::list_attachments),
+        )
+        .route("/notes/:id/attachments/:attachment_id", axum::routing::delete(handlers::notes::delete_attachment))
         .route(
             "/notes/:id/revisions",
             get(handlers::notes::list_revisions).post(handlers::notes::create_revision),

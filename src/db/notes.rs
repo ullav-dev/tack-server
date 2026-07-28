@@ -121,6 +121,80 @@ async fn insert_attachment(
     Ok(())
 }
 
+fn row_to_attachment(row: &Row) -> crate::models::note::NoteAttachment {
+    crate::models::note::NoteAttachment {
+        id: row.get("id"),
+        note_id: row.get("content_id"),
+        owning_service: row.get("owning_service"),
+        entity_type: row.get("entity_type"),
+        entity_id: row.get("entity_id"),
+        created_at: row.get("created_at"),
+    }
+}
+
+/// Attaches an *already-created* note to another entity -- the standalone
+/// counterpart to `insert_attachment` (which only runs inside
+/// `create_note`'s transaction). Lets a caller like Cartlann link one note to
+/// several of its own objects over time, since `CreateNoteRequest.attach`
+/// only ever supports a single attachment made at creation.
+pub async fn attach_note(
+    pool: &Pool,
+    organization_id: Uuid,
+    note_id: Uuid,
+    attach: &NewAttachment,
+) -> Result<crate::models::note::NoteAttachment, AppError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_one(
+            "INSERT INTO content_attachments (organization_id, content_type, content_id, owning_service, entity_type, entity_id)
+             VALUES ($1, 'note', $2, $3, $4, $5)
+             RETURNING id, content_id, owning_service, entity_type, entity_id, created_at",
+            &[&organization_id, &note_id, &attach.owning_service, &attach.entity_type, &attach.entity_id],
+        )
+        .await?;
+    Ok(row_to_attachment(&row))
+}
+
+/// A note's own attachments -- the reverse of `list_notes_by_attachment`
+/// (that finds notes given an entity; this finds entities given a note).
+pub async fn list_note_attachments(
+    pool: &Pool,
+    organization_id: Uuid,
+    note_id: Uuid,
+) -> Result<Vec<crate::models::note::NoteAttachment>, AppError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT id, content_id, owning_service, entity_type, entity_id, created_at
+             FROM content_attachments
+             WHERE organization_id = $1 AND content_type = 'note' AND content_id = $2
+             ORDER BY created_at ASC",
+            &[&organization_id, &note_id],
+        )
+        .await?;
+    Ok(rows.iter().map(row_to_attachment).collect())
+}
+
+pub async fn delete_note_attachment(
+    pool: &Pool,
+    organization_id: Uuid,
+    note_id: Uuid,
+    attachment_id: Uuid,
+) -> Result<(), AppError> {
+    let client = pool.get().await?;
+    let deleted = client
+        .execute(
+            "DELETE FROM content_attachments
+             WHERE id = $1 AND organization_id = $2 AND content_type = 'note' AND content_id = $3",
+            &[&attachment_id, &organization_id, &note_id],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound("Attachment not found.".into()));
+    }
+    Ok(())
+}
+
 /// Top-level notes attached to a specific external entity (e.g. a lagan pull
 /// request's discussion thread), newest-first — mirrors `list_team_notes`'
 /// shape but joined through `content_attachments` instead of filtered by
