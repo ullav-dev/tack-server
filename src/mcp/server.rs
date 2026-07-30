@@ -20,7 +20,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ServerCapabilities, ServerInfo},
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer,
 };
@@ -129,7 +129,7 @@ impl TackMcpServer {
         &self,
         Parameters(p): Parameters<SearchContentParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let user = caller_from_ctx(&context)?;
         let caller = SearchCaller {
             user_id: user.user_id,
@@ -140,7 +140,9 @@ impl TackMcpServer {
         let hits = self.search.search(&p.query, &caller, self.embedder.as_ref()).await.map_err(app_err)?;
         let limit = p.limit.unwrap_or(20).max(0) as usize;
         let hits = &hits[..hits.len().min(limit)];
-        Ok(serde_json::to_string_pretty(hits).unwrap())
+        let text = serde_json::to_string_pretty(hits).unwrap();
+        let structured = serde_json::to_value(hits).unwrap();
+        Ok(super::text_result(text, structured))
     }
 
     /// Get a note and all of its replies in one call.
@@ -149,12 +151,13 @@ impl TackMcpServer {
         &self,
         Parameters(p): Parameters<GetNoteThreadParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let user = caller_from_ctx(&context)?;
         let note_id = parse_uuid(&p.note_id)?;
         let note = resolve_visible_note(&self.db, &user, note_id).await.map_err(app_err)?;
         let replies = db::notes::list_replies(&self.db, note.id, note.organization_id).await.map_err(app_err)?;
-        Ok(serde_json::to_string_pretty(&json!({ "note": note, "replies": replies })).unwrap())
+        let structured = json!({ "note": note, "replies": replies });
+        Ok(super::text_result(serde_json::to_string_pretty(&structured).unwrap(), structured))
     }
 
     /// Create a new top-level note.
@@ -163,7 +166,7 @@ impl TackMcpServer {
         &self,
         Parameters(p): Parameters<CreateNoteParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let user = caller_from_ctx(&context)?;
         if p.title.trim().is_empty() {
             return Err(rmcp::ErrorData::invalid_params("title must not be empty", None));
@@ -189,7 +192,9 @@ impl TackMcpServer {
         )
         .await
         .map_err(app_err)?;
-        Ok(serde_json::to_string_pretty(&note).unwrap())
+        let text = serde_json::to_string_pretty(&note).unwrap();
+        let structured = serde_json::to_value(&note).unwrap();
+        Ok(super::text_result(text, structured))
     }
 
     /// Reply to an existing note.
@@ -198,7 +203,7 @@ impl TackMcpServer {
         &self,
         Parameters(p): Parameters<ReplyToNoteParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let user = caller_from_ctx(&context)?;
         if p.body_markdown.trim().is_empty() {
             return Err(rmcp::ErrorData::invalid_params("body_markdown must not be empty", None));
@@ -207,7 +212,9 @@ impl TackMcpServer {
         let parent = resolve_visible_note(&self.db, &user, note_id).await.map_err(app_err)?;
         let reply =
             db::notes::create_reply(&self.db, &parent, user.user_id, &p.body_markdown, None).await.map_err(app_err)?;
-        Ok(serde_json::to_string_pretty(&reply).unwrap())
+        let text = serde_json::to_string_pretty(&reply).unwrap();
+        let structured = serde_json::to_value(&reply).unwrap();
+        Ok(super::text_result(text, structured))
     }
 }
 
