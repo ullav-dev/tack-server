@@ -19,6 +19,7 @@ fn row_to_note(row: &Row) -> Note {
         organization_id: row.get("organization_id"),
         team_id: row.get("team_id"),
         parent_id: row.get("parent_id"),
+        folder_id: row.get("folder_id"),
         visibility: Visibility::from_db_str(row.get("visibility")),
         title: row.get("title"),
         body_markdown: row.get("body_markdown"),
@@ -31,7 +32,7 @@ fn row_to_note(row: &Row) -> Note {
 }
 
 const NOTE_SELECT: &str = "
-    SELECT n.id, n.organization_id, n.team_id, n.parent_id, n.visibility, n.title,
+    SELECT n.id, n.organization_id, n.team_id, n.parent_id, n.folder_id, n.visibility, n.title,
            n.created_by, n.created_at, n.updated_at, n.in_reply_to_version,
            b.body_markdown,
            (SELECT COUNT(*) FROM notes r
@@ -56,6 +57,9 @@ pub struct NewNote {
     pub created_by: Uuid,
     pub title: String,
     pub body_markdown: String,
+    /// Must belong to `team_id` -- checked by the handler before this is
+    /// called (`db::note_folders::folder_belongs_to_team`).
+    pub folder_id: Option<Uuid>,
     pub attach: Option<NewAttachment>,
     /// Backfill-only override — see `CreateNoteRequest::created_at`. `None`
     /// means "now," same as before this field existed.
@@ -74,8 +78,8 @@ pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
     let created_at = new.created_at.unwrap_or_else(Utc::now);
 
     tx.execute(
-        "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, title, created_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7, $8, $8)",
+        "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, title, created_by, folder_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4::ltree, $5, $6, $7, $8, $9, $9)",
         &[
             &id,
             &new.organization_id,
@@ -84,6 +88,7 @@ pub async fn create_note(pool: &Pool, new: NewNote) -> Result<Note, AppError> {
             &new.visibility.as_db_str(),
             &new.title,
             &new.created_by,
+            &new.folder_id,
             &created_at,
         ],
     )
@@ -342,6 +347,17 @@ pub async fn get_note_admin_any_org(pool: &Pool, id: Uuid) -> Result<Option<Note
     Ok(row.as_ref().map(row_to_note))
 }
 
+/// Narrows `list_team_notes` by folder. `None` (the default, via
+/// `GET /notes?team_id=` with no folder params) preserves the original
+/// unfiltered behavior -- every existing caller (`NotesList.tsx`, the MCP
+/// `search_content`/`get_note_thread` path) keeps working unchanged.
+pub enum FolderScope {
+    /// Only notes filed in this folder.
+    Folder(Uuid),
+    /// Only notes with no folder at all.
+    Unfiled,
+}
+
 /// Top-level notes filed under a specific team. `caller_id` scopes out
 /// private notes that don't belong to the caller — the handler has already
 /// verified the caller is a member of `team_id`, so team- and
@@ -356,18 +372,32 @@ pub async fn list_team_notes(
     organization_id: Uuid,
     team_id: Uuid,
     caller_id: Uuid,
+    folder: Option<FolderScope>,
     limit: i64,
     offset: i64,
 ) -> Result<crate::models::note::NotesPage, AppError> {
     let client = pool.get().await?;
+    let folder_clause = match folder {
+        None => "",
+        Some(FolderScope::Folder(_)) => "AND n.folder_id = $6",
+        Some(FolderScope::Unfiled) => "AND n.folder_id IS NULL",
+    };
     let sql = format!(
         "{NOTE_SELECT}
          WHERE n.organization_id = $1 AND n.team_id = $2 AND n.parent_id IS NULL AND n.deleted_at IS NULL
            AND (n.visibility != 'private' OR n.created_by = $3)
+           {folder_clause}
          ORDER BY n.created_at DESC
          LIMIT $4 OFFSET $5"
     );
-    let rows = client.query(&sql, &[&organization_id, &team_id, &caller_id, &(limit + 1), &offset]).await?;
+    let rows = match folder {
+        Some(FolderScope::Folder(folder_id)) => {
+            client
+                .query(&sql, &[&organization_id, &team_id, &caller_id, &(limit + 1), &offset, &folder_id])
+                .await?
+        }
+        _ => client.query(&sql, &[&organization_id, &team_id, &caller_id, &(limit + 1), &offset]).await?,
+    };
     let has_more = rows.len() as i64 > limit;
     let notes = rows.iter().take(limit as usize).map(row_to_note).collect();
     Ok(crate::models::note::NotesPage { notes, has_more })
@@ -397,9 +427,22 @@ pub async fn update_note(
     new_title: Option<&str>,
     new_body: Option<&str>,
     new_visibility: Option<Visibility>,
+    // Tri-state, mirroring `UpdateNoteRequest::folder_id`: `None` = leave
+    // unchanged, `Some(None)` = unfile, `Some(Some(id))` = file/move there.
+    // Already validated by the handler (top-level note only, folder belongs
+    // to the note's own team).
+    new_folder_id: Option<Option<Uuid>>,
 ) -> Result<Note, AppError> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+
+    if let Some(folder_id) = new_folder_id {
+        tx.execute(
+            "UPDATE notes SET folder_id = $1, updated_at = NOW() WHERE id = $2 AND organization_id = $3",
+            &[&folder_id, &note.id, &note.organization_id],
+        )
+        .await?;
+    }
 
     if let Some(title) = new_title {
         tx.execute(

@@ -72,6 +72,16 @@ Health check (`GET /health`) and a whoami endpoint (`GET /me`, gated by `TackUse
 
 **Explicitly deferred**: true cross-service reference resolution (needs a new public endpoint in each owning service, starting with `awe-server`); periodic automatic Yjs-bloat-management snapshots (distinct from `page_revisions`, see above); multilingual ICU analysis for the lexical side of Page search (same pre-existing gap as Notes, see "Search" above).
 
+## Notes folders
+
+`migrations/008_note_folders.sql`: `note_folders` -- a flat (non-nested), per-team grouping for *top-level* notes only, org-hash-partitioned into 32 buckets like every other content table. `notes.folder_id` (nullable) is enforced top-level-only by a DB `CHECK` constraint (`parent_id IS NULL OR folder_id IS NULL`) -- a reply can never be independently filed, only its parent thread can. The composite FK (`notes_folder_id_fkey`) deliberately carries **no** `ON DELETE` action: a composite `ON DELETE SET NULL` would try to null `notes.organization_id` too (it's part of the FK) and violate that column's own `NOT NULL` constraint. Instead `db::note_folders::delete_folder` explicitly unfiles every note in the folder (`folder_id = NULL`) in the same transaction before deleting the folder row -- a note is never deleted along with its folder, only ungrouped.
+
+Folders carry no visibility/ACL of their own -- they're an organizational tool, not access-controlled content. Any member of the folder's `team_id` may create/rename/delete it (`handlers::note_folders::resolve_folder_for_caller`); each note's own `Visibility` still governs who can see it once inside. `GET /notes?team_id=` gained optional `folder_id=`/`unfiled=` params (mutually exclusive); omitting both preserves the original unfiltered behavior exactly, so no existing caller (the frontend's `NotesList.tsx`, the MCP `search_content`/`get_note_thread` tools) needed to change. `PATCH /notes/{id}` gained a tri-state `folder_id` field (omit = unchanged, `null` = unfile, a value = file/move) via a `deserialize_some` double-`Option` wrapper, since ordinary `Option<T>` can't distinguish "omitted" from "explicitly null." No outbox events are enqueued for folder CRUD or for a folder-only note PATCH -- folders aren't indexed/searchable content, so there's nothing for `tack-indexer` to do with that event.
+
+REST surface: `POST`/`GET /note-folders`, `PATCH`/`DELETE /note-folders/{id}`. No MCP tool exposes folders yet (out of scope for this pass -- `create_note`/`reply_to_note` are unaffected, just pass `folder_id: None`).
+
+Verified live against a real Postgres instance (a throwaway `db::` call script, not committed): created a folder, filed a note into it at creation time, listed it both folder-scoped and unfiled-scoped (confirming mutual exclusivity), moved it out and back in via the tri-state PATCH semantics, confirmed an unrelated title-only edit leaves `folder_id` untouched, renamed the folder, then deleted it and confirmed the note survives, unfiled, rather than being deleted along with its folder.
+
 ## Branch Policy
 
 Feature branches merge to `main` via PR; do not commit directly to `main`.

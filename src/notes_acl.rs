@@ -80,6 +80,7 @@ mod tests {
             organization_id: org,
             team_id: team,
             parent_id: None,
+            folder_id: None,
             visibility,
             title: "title".into(),
             body_markdown: "body".into(),

@@ -62,6 +62,10 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::notes::list_revisions,
         handlers::notes::create_revision,
         handlers::notes::delete_revision,
+        handlers::note_folders::create_note_folder,
+        handlers::note_folders::list_note_folders,
+        handlers::note_folders::update_note_folder,
+        handlers::note_folders::delete_note_folder,
         handlers::search::search,
         handlers::spaces::create_space,
         handlers::spaces::list_spaces,
@@ -95,6 +99,9 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::note::NoteRevision,
         models::note::NotesPage,
         models::note::NoteAttachment,
+        models::note::NoteFolder,
+        models::note::CreateNoteFolderRequest,
+        models::note::UpdateNoteFolderRequest,
         search::SearchHit,
         models::page::Space,
         models::page::CreateSpaceRequest,
@@ -241,6 +248,15 @@ async fn main() -> Result<()> {
             get(handlers::notes::list_revisions).post(handlers::notes::create_revision),
         )
         .route("/notes/:id/revisions/:revision_id", axum::routing::delete(handlers::notes::delete_revision))
+        .route(
+            "/note-folders",
+            post(handlers::note_folders::create_note_folder).get(handlers::note_folders::list_note_folders),
+        )
+        .route(
+            "/note-folders/:id",
+            axum::routing::patch(handlers::note_folders::update_note_folder)
+                .delete(handlers::note_folders::delete_note_folder),
+        )
         .route("/search", get(handlers::search::search))
         .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
         .route("/spaces/:id/pages", get(handlers::pages::list_pages))

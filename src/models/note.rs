@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -38,6 +38,10 @@ pub struct Note {
     pub organization_id: Uuid,
     pub team_id: Option<Uuid>,
     pub parent_id: Option<Uuid>,
+    /// The folder this note is filed under, or `None` if unfiled. Only ever
+    /// set on a top-level note (`parent_id IS NULL`) -- enforced by a DB
+    /// CHECK constraint, see `008_note_folders.sql`.
+    pub folder_id: Option<Uuid>,
     pub visibility: Visibility,
     /// Empty for replies -- only top-level notes collect a title (enforced
     /// in the handler, not the schema; see `handlers::notes::create_note`).
@@ -91,6 +95,11 @@ pub struct CreateNoteRequest {
     pub visibility: Visibility,
     pub title: String,
     pub body_markdown: String,
+    /// Optionally files the new note under a folder at creation time, instead
+    /// of leaving it unfiled and moving it in later via `PATCH /notes/{id}`.
+    /// Must belong to `team_id` -- checked by the handler.
+    #[serde(default)]
+    pub folder_id: Option<Uuid>,
     /// Optionally attaches this note to an external entity (`content_attachments`)
     /// in the same transaction as its creation, e.g. a lagan pull request's
     /// discussion thread.
@@ -139,6 +148,20 @@ pub struct NoteAttachment {
     pub created_at: DateTime<Utc>,
 }
 
+/// Distinguishes "field omitted" from "field explicitly set to `null`" for a
+/// nullable `PATCH` field -- ordinary `Option<T>` can't tell those apart
+/// (both deserialize to `None`), but `folder_id` needs all three states:
+/// omitted (don't touch), `null` (unfile), or a value (move/assign). Wraps
+/// the outcome in a second `Option`, so `None` = omitted, `Some(None)` =
+/// explicit null, `Some(Some(id))` = a value.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateNoteRequest {
     /// Does NOT create a new revision -- see `POST /notes/{id}/revisions`
@@ -149,6 +172,13 @@ pub struct UpdateNoteRequest {
     /// history isn't tracked, matching Pages, which doesn't version its
     /// title either.
     pub title: Option<String>,
+    /// Tri-state: omit to leave the note's folder unchanged, `null` to
+    /// unfile it, or a folder id to file/move it there. Rejected by the
+    /// handler on a reply (only top-level notes can be filed) or if the
+    /// folder isn't in the note's own team. See `deserialize_some` above.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    #[schema(value_type = Option<Uuid>, nullable)]
+    pub folder_id: Option<Option<Uuid>>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -159,4 +189,65 @@ pub struct NoteRevision {
     pub body_markdown: String,
     pub edited_by: Uuid,
     pub edited_at: DateTime<Utc>,
+}
+
+/// A flat (non-nested), per-team grouping for top-level notes — see
+/// `008_note_folders.sql`. Any member of `team_id` may create, rename, or
+/// delete a folder (this is an organizational tool, not access-controlled
+/// content — a folder itself carries no visibility of its own; each note's
+/// own `Visibility` still governs who can see it inside the folder).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NoteFolder {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub team_id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Count of top-level notes currently filed here — denormalized at read
+    /// time (not stored), same convention as `Note.reply_count` and
+    /// `Page.child_count`. Lets the UI show a count, and a delete
+    /// confirmation warn how many notes will be unfiled, without a separate
+    /// fetch.
+    pub note_count: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateNoteFolderRequest {
+    pub team_id: Uuid,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateNoteFolderRequest {
+    pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole "unfile a note" feature depends on this: `Option<Option<T>>`
+    /// via `deserialize_some` must actually distinguish omitted from
+    /// explicit-null. `cargo build` only proves this compiles, not that it
+    /// behaves -- verify all three tri-states directly against real JSON.
+    #[test]
+    fn folder_id_omitted_deserializes_to_none() {
+        let req: UpdateNoteRequest = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
+        assert_eq!(req.folder_id, None, "omitting folder_id must mean 'leave it unchanged'");
+    }
+
+    #[test]
+    fn folder_id_explicit_null_deserializes_to_some_none() {
+        let req: UpdateNoteRequest = serde_json::from_str(r#"{"folder_id":null}"#).unwrap();
+        assert_eq!(req.folder_id, Some(None), "explicit null must mean 'unfile'");
+    }
+
+    #[test]
+    fn folder_id_with_value_deserializes_to_some_some() {
+        let id = Uuid::new_v4();
+        let json = format!(r#"{{"folder_id":"{id}"}}"#);
+        let req: UpdateNoteRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.folder_id, Some(Some(id)), "a folder id must mean 'file/move there'");
+    }
 }
