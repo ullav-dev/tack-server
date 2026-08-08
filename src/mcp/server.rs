@@ -186,6 +186,7 @@ impl TackMcpServer {
                 created_by: user.user_id,
                 title: p.title,
                 body_markdown: p.body_markdown,
+                folder_id: None,
                 attach: None,
                 created_at: None,
             },

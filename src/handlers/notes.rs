@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::auth::TackUser;
 use crate::db;
+use crate::db::notes::FolderScope;
 use crate::error::{AppError, AppResult};
+use crate::handlers::note_folders::check_folder_in_team;
 use crate::models::note::{
     AttachRequest, CreateNoteRequest, Note, NoteAttachment, NoteRevision, NotesPage, ReplyRequest, UpdateNoteRequest,
 };
@@ -33,6 +35,9 @@ pub async fn create_note(
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
     let organization_id = resolve_team_organization(&user, body.team_id)?;
+    if let Some(folder_id) = body.folder_id {
+        check_folder_in_team(&state, organization_id, body.team_id, folder_id).await?;
+    }
     // Backfill-only: only an admin caller's created_at/created_by overrides
     // are honored, so an ordinary API consumer can never backdate a note or
     // attribute it to someone else.
@@ -47,6 +52,7 @@ pub async fn create_note(
             created_by,
             title: body.title,
             body_markdown: body.body_markdown,
+            folder_id: body.folder_id,
             attach: body.attach.map(|a| db::notes::NewAttachment {
                 owning_service: a.owning_service,
                 entity_type: a.entity_type,
@@ -117,6 +123,13 @@ pub struct ListNotesQuery {
     pub limit: Option<i64>,
     /// Defaults to 0.
     pub offset: Option<i64>,
+    /// Only notes filed in this folder. Omit (along with `unfiled`) for the
+    /// original, unfiltered behavior -- every note in the team regardless of
+    /// folder. Mutually exclusive with `unfiled`.
+    pub folder_id: Option<Uuid>,
+    /// Only notes with no folder at all. Mutually exclusive with `folder_id`.
+    #[serde(default)]
+    pub unfiled: bool,
 }
 
 #[utoipa::path(
@@ -126,6 +139,8 @@ pub struct ListNotesQuery {
         ("team_id" = Uuid, Query, description = "List top-level notes filed under this team"),
         ("limit" = Option<i64>, Query, description = "Page size, default 20, max 100"),
         ("offset" = Option<i64>, Query, description = "Offset into the (newest-first) list, default 0"),
+        ("folder_id" = Option<Uuid>, Query, description = "Only notes filed in this folder"),
+        ("unfiled" = Option<bool>, Query, description = "Only notes with no folder"),
     ),
     responses((status = 200, description = "A page of top-level notes for this team", body = NotesPage)),
     tag = "notes"
@@ -135,11 +150,20 @@ pub async fn list_notes(
     user: TackUser,
     Query(query): Query<ListNotesQuery>,
 ) -> AppResult<Json<NotesPage>> {
+    if query.folder_id.is_some() && query.unfiled {
+        return Err(AppError::BadRequest("folder_id and unfiled are mutually exclusive.".into()));
+    }
     let organization_id = resolve_team_organization(&user, query.team_id)?;
     let limit = query.limit.unwrap_or(DEFAULT_NOTES_LIMIT).clamp(1, MAX_NOTES_LIMIT);
     let offset = query.offset.unwrap_or(0).max(0);
+    let folder = match (query.folder_id, query.unfiled) {
+        (Some(id), _) => Some(FolderScope::Folder(id)),
+        (None, true) => Some(FolderScope::Unfiled),
+        (None, false) => None,
+    };
     let notes =
-        db::notes::list_team_notes(&state.db, organization_id, query.team_id, user.user_id, limit, offset).await?;
+        db::notes::list_team_notes(&state.db, organization_id, query.team_id, user.user_id, folder, limit, offset)
+            .await?;
     Ok(Json(notes))
 }
 
@@ -185,9 +209,26 @@ pub async fn update_note(
             return Err(AppError::BadRequest("body_markdown must not be empty".into()));
         }
     }
-    let updated =
-        db::notes::update_note(&state.db, &note, body.title.as_deref(), body.body_markdown.as_deref(), body.visibility)
-            .await?;
+    if let Some(folder_id) = body.folder_id {
+        if note.parent_id.is_some() {
+            return Err(AppError::BadRequest("Replies can't be filed into a folder -- only top-level notes can.".into()));
+        }
+        if let Some(folder_id) = folder_id {
+            let team_id = note
+                .team_id
+                .ok_or_else(|| AppError::BadRequest("This note has no team, so it can't be filed into a folder.".into()))?;
+            check_folder_in_team(&state, note.organization_id, team_id, folder_id).await?;
+        }
+    }
+    let updated = db::notes::update_note(
+        &state.db,
+        &note,
+        body.title.as_deref(),
+        body.body_markdown.as_deref(),
+        body.visibility,
+        body.folder_id,
+    )
+    .await?;
     Ok(Json(updated))
 }
 
