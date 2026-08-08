@@ -222,3 +222,32 @@ pub struct CreateNoteFolderRequest {
 pub struct UpdateNoteFolderRequest {
     pub name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole "unfile a note" feature depends on this: `Option<Option<T>>`
+    /// via `deserialize_some` must actually distinguish omitted from
+    /// explicit-null. `cargo build` only proves this compiles, not that it
+    /// behaves -- verify all three tri-states directly against real JSON.
+    #[test]
+    fn folder_id_omitted_deserializes_to_none() {
+        let req: UpdateNoteRequest = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
+        assert_eq!(req.folder_id, None, "omitting folder_id must mean 'leave it unchanged'");
+    }
+
+    #[test]
+    fn folder_id_explicit_null_deserializes_to_some_none() {
+        let req: UpdateNoteRequest = serde_json::from_str(r#"{"folder_id":null}"#).unwrap();
+        assert_eq!(req.folder_id, Some(None), "explicit null must mean 'unfile'");
+    }
+
+    #[test]
+    fn folder_id_with_value_deserializes_to_some_some() {
+        let id = Uuid::new_v4();
+        let json = format!(r#"{{"folder_id":"{id}"}}"#);
+        let req: UpdateNoteRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.folder_id, Some(Some(id)), "a folder id must mean 'file/move there'");
+    }
+}

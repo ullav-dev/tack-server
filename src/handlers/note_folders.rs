@@ -21,7 +21,7 @@ use crate::AppState;
 /// team-membership check, not a creator/admin one.
 pub async fn resolve_folder_for_caller(state: &AppState, user: &TackUser, id: Uuid) -> AppResult<NoteFolder> {
     for org_id in user.organization_ids() {
-        if let Some(folder) = db::note_folders::get_folder(&state.db, id, org_id).await? {
+        if let Some(folder) = db::note_folders::get_folder(&state.db, id, org_id, user.user_id).await? {
             if user.is_admin || user.teams.contains_key(&folder.team_id) {
                 return Ok(folder);
             }
@@ -40,14 +40,16 @@ pub async fn resolve_folder_for_caller(state: &AppState, user: &TackUser, id: Uu
 /// `team_id` in `organization_id` -- shared by `create_note` and
 /// `update_note` in `handlers::notes`, since both let a caller file a note
 /// into a folder and neither should silently accept a folder from a
-/// different team (or one that doesn't exist).
+/// different team (or one that doesn't exist). `caller_id` only affects the
+/// returned `note_count` (unused here), but `get_folder` requires it.
 pub async fn check_folder_in_team(
     state: &AppState,
     organization_id: Uuid,
     team_id: Uuid,
     folder_id: Uuid,
+    caller_id: Uuid,
 ) -> AppResult<()> {
-    let folder = db::note_folders::get_folder(&state.db, folder_id, organization_id)
+    let folder = db::note_folders::get_folder(&state.db, folder_id, organization_id, caller_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("folder_id does not refer to an existing folder.".into()))?;
     if folder.team_id != team_id {
@@ -73,7 +75,7 @@ pub async fn create_note_folder(
         return Err(AppError::BadRequest("name must not be empty".into()));
     }
     let organization_id = resolve_team_organization(&user, body.team_id)?;
-    let folder = db::note_folders::create_folder(&state.db, organization_id, body.team_id, name).await?;
+    let folder = db::note_folders::create_folder(&state.db, organization_id, body.team_id, name, user.user_id).await?;
     Ok(Json(folder))
 }
 
@@ -108,7 +110,7 @@ pub async fn list_note_folders(
     };
     let mut folders = Vec::new();
     for org_id in user.organization_ids() {
-        folders.extend(db::note_folders::list_folders_for_teams(&state.db, org_id, &team_ids).await?);
+        folders.extend(db::note_folders::list_folders_for_teams(&state.db, org_id, &team_ids, user.user_id).await?);
     }
     Ok(Json(folders))
 }
@@ -131,7 +133,7 @@ pub async fn update_note_folder(
         return Err(AppError::BadRequest("name must not be empty".into()));
     }
     let folder = resolve_folder_for_caller(&state, &user, id).await?;
-    let updated = db::note_folders::rename_folder(&state.db, &folder, name).await?;
+    let updated = db::note_folders::rename_folder(&state.db, &folder, name, user.user_id).await?;
     Ok(Json(updated))
 }
 

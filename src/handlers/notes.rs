@@ -36,7 +36,7 @@ pub async fn create_note(
     }
     let organization_id = resolve_team_organization(&user, body.team_id)?;
     if let Some(folder_id) = body.folder_id {
-        check_folder_in_team(&state, organization_id, body.team_id, folder_id).await?;
+        check_folder_in_team(&state, organization_id, body.team_id, folder_id, user.user_id).await?;
     }
     // Backfill-only: only an admin caller's created_at/created_by overrides
     // are honored, so an ordinary API consumer can never backdate a note or
@@ -217,7 +217,7 @@ pub async fn update_note(
             let team_id = note
                 .team_id
                 .ok_or_else(|| AppError::BadRequest("This note has no team, so it can't be filed into a folder.".into()))?;
-            check_folder_in_team(&state, note.organization_id, team_id, folder_id).await?;
+            check_folder_in_team(&state, note.organization_id, team_id, folder_id, user.user_id).await?;
         }
     }
     let updated = db::notes::update_note(
