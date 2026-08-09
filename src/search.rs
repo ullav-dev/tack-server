@@ -39,6 +39,11 @@ const RRF_K: f64 = 60.0;
 /// which no search engine does either.
 const RAW_FETCH_SIZE: i64 = 200;
 
+/// Below this many characters, `SearchClient::search` skips the kNN
+/// sub-query entirely -- see that function's own doc comment for the live
+/// measurement behind this.
+const MIN_SEMANTIC_QUERY_CHARS: usize = 4;
+
 #[derive(Clone)]
 pub struct SearchClient {
     base_url: String,
@@ -222,7 +227,31 @@ impl SearchClient {
     /// check happens as a live post-filter in `handlers::search::search`,
     /// the same live-recheck idiom already used by `handlers::pages::search_pages`.
     pub async fn index_page(&self, page: &Page, embedder: Option<&Embedder>) -> Result<()> {
-        let chunks = chunk_text(&page.content_markdown);
+        // `chunk_text("")` returns one chunk holding an *empty* string, not
+        // zero chunks (a wrong assumption this function used to make) --
+        // filtered out here so an empty/whitespace-only page never gets a
+        // document indexed (with a real, meaningless embedding) in the
+        // first place. The old code indexed it unconditionally, then tried
+        // to delete it via `delete_page` in the same call -- a real,
+        // observed race against OpenSearch's near-real-time refresh
+        // (roughly 1s by default): a delete_by_query issued immediately
+        // after an index request can run its internal search phase before
+        // that write is refreshed/visible, finding nothing to delete and
+        // leaving the empty-text document orphaned in the index
+        // permanently. Confirmed live: several genuinely empty pages had a
+        // `text: ""` document sitting in the index with a real embedding,
+        // which -- because of E5's well-known anisotropy on very short
+        // inputs (near-uniform ~0.90-0.94 cosine similarity to *any* query,
+        // relevant or not) -- surfaced as bogus top-10 kNN hits for
+        // completely unrelated searches like "44" or "abx".
+        let chunks: Vec<(i32, String)> =
+            chunk_text(&page.content_markdown).into_iter().filter(|(_, t)| !t.trim().is_empty()).collect();
+        if chunks.is_empty() {
+            // Nothing real left to index -- remove any chunks from a
+            // previous, non-empty version of this page and stop before
+            // ever creating a new empty document.
+            return self.delete_page(page.id).await;
+        }
         let embeddings: Vec<Option<Vec<f32>>> = if let Some(embedder) = embedder {
             let texts: Vec<String> = chunks.iter().map(|(_, t)| t.clone()).collect();
             match embedder.embed_passages(texts).await {
@@ -264,12 +293,6 @@ impl SearchClient {
                 let body = resp.text().await.unwrap_or_default();
                 anyhow::bail!("failed to index {doc_id}: {body}");
             }
-        }
-        // A page with no content yet (chunk_text("") produces zero chunks)
-        // still needs any *previously* indexed chunks removed -- e.g. the
-        // page was edited down to empty. Cheap and idempotent either way.
-        if page.content_markdown.trim().is_empty() {
-            self.delete_page(page.id).await?;
         }
         Ok(())
     }
@@ -330,20 +353,41 @@ impl SearchClient {
         });
         let lexical_hits = self.raw_search(lexical_query).await?;
 
+        // Below MIN_SEMANTIC_QUERY_CHARS, skip kNN entirely rather than run
+        // it and trust the fused ranking to sort out the noise. Measured
+        // live, not assumed: multilingual-e5-small's cosine similarity is
+        // severely anisotropic on very short/low-information inputs like
+        // "44" or "abx" -- *every* indexed chunk, relevant or not, scored
+        // in a tight ~0.90-0.94 band regardless of actual relevance (a
+        // completely unrelated wiki page scored higher than some genuine
+        // matches), so kNN was contributing pure noise, not weak signal.
+        // Lexical (BM25) alone already gets these exactly right --
+        // confirmed live: "44" correctly found only the one note that
+        // literally contains "44"; "abx" correctly found zero hits, matching
+        // there being no such text anywhere in the corpus. A longer query
+        // still gets the full hybrid treatment; this only turns off the
+        // branch that was actively making short queries worse.
         let knn_hits = if let Some(embedder) = embedder {
-            let vector = embedder.embed_query(query_text).await?;
-            let knn_field = json!({
-                "vector": vector,
-                "k": RAW_FETCH_SIZE,
-                "filter": { "bool": { "filter": filters } }
-            });
-            // A pure-semantic match can share zero literal terms with the
-            // query, so this highlight is frequently empty -- the frontend
-            // falls back to a plain truncated `text` prefix in that case,
-            // not a missing snippet.
-            let knn_query =
-                json!({ "size": RAW_FETCH_SIZE, "query": { "knn": { "embedding": knn_field } }, "highlight": highlight });
-            self.raw_search(knn_query).await?
+            if query_text.trim().chars().count() < MIN_SEMANTIC_QUERY_CHARS {
+                Vec::new()
+            } else {
+                let vector = embedder.embed_query(query_text).await?;
+                let knn_field = json!({
+                    "vector": vector,
+                    "k": RAW_FETCH_SIZE,
+                    "filter": { "bool": { "filter": filters } }
+                });
+                // A pure-semantic match can share zero literal terms with the
+                // query, so this highlight is frequently empty -- the frontend
+                // falls back to a plain truncated `text` prefix in that case,
+                // not a missing snippet.
+                let knn_query = json!({
+                    "size": RAW_FETCH_SIZE,
+                    "query": { "knn": { "embedding": knn_field } },
+                    "highlight": highlight
+                });
+                self.raw_search(knn_query).await?
+            }
         } else {
             Vec::new()
         };

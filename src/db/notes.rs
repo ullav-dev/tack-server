@@ -515,7 +515,15 @@ pub async fn update_note(
         .await?;
     }
 
-    if new_title.is_some() || new_body.is_some() || new_visibility.is_some() {
+    // folder_id is part of the search index mapping (added in the search
+    // overhaul, after this "folders aren't searchable content" assumption
+    // was first written) -- a folder-only PATCH has to reindex too, or a
+    // note's folder badge in search results goes stale forever the moment
+    // it's filed/moved/unfiled, only ever catching up if the note happens
+    // to be title/body/visibility-edited again for an unrelated reason.
+    // Found live: filing a note found via search into a folder, then
+    // re-searching, kept showing it as unfiled.
+    if new_title.is_some() || new_body.is_some() || new_visibility.is_some() || new_folder_id.is_some() {
         enqueue_outbox_event(&tx, note.organization_id, note.id, "updated").await?;
     }
 
