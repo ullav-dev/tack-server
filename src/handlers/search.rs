@@ -1,9 +1,11 @@
 use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::auth::TackUser;
 use crate::error::AppResult;
+use crate::notes_acl::resolve_team_organization;
 use crate::pages_acl::resolve_visible_page;
 use crate::search::{SearchCaller, SearchHit, SearchResults, SearchTypeResults};
 use crate::AppState;
@@ -14,6 +16,12 @@ const MAX_SEARCH_LIMIT: i64 = 50;
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
     pub q: String,
+    /// Search is scoped to one team at a time, same as `GET /notes` --
+    /// required, not optional, so a hit can never surface from a team the
+    /// caller isn't currently looking at (see `SearchCaller`'s doc comment
+    /// for why this replaced the old "every team/org the caller belongs
+    /// to" behavior).
+    pub team_id: Uuid,
     /// Defaults to 10, capped at 50.
     pub notes_limit: Option<i64>,
     /// Defaults to 0.
@@ -34,10 +42,14 @@ fn paginate(hits: Vec<SearchHit>, limit: i64, offset: i64) -> SearchTypeResults 
     SearchTypeResults { hits: page, total }
 }
 
-/// Hybrid (BM25 + kNN semantic) search across the caller's visible content —
-/// ACL is enforced *in* both queries themselves (see
-/// `SearchCaller::acl_filter`), resolved live from the caller's current JWT
-/// team/org claims on every call, same as direct reads via `GET /notes/:id`.
+/// Hybrid (BM25 + kNN semantic) search, scoped to one team at a time (same
+/// as `GET /notes?team_id=`) — a hit can never surface from a team the
+/// caller isn't currently looking at. `resolve_team_organization` enforces
+/// the same membership check every other team-scoped write already uses,
+/// including for an admin caller (an admin still has to belong to the team
+/// being searched, exactly like `GET /notes` never bypasses its own
+/// `team_id` filter for admins). ACL is otherwise enforced *in* both
+/// queries themselves (see `SearchCaller::filters`).
 /// Degrades to lexical-only if the embedding model isn't loaded.
 ///
 /// Results are grouped by content type and paginated independently
@@ -52,6 +64,7 @@ fn paginate(hits: Vec<SearchHit>, limit: i64, offset: i64) -> SearchTypeResults 
     path = "/search",
     params(
         ("q" = String, Query, description = "Free-text query"),
+        ("team_id" = Uuid, Query, description = "Scope results to this team -- required, the caller must be a member"),
         ("notes_limit" = Option<i64>, Query, description = "Note results page size, default 10, max 50"),
         ("notes_offset" = Option<i64>, Query, description = "Note results offset, default 0"),
         ("pages_limit" = Option<i64>, Query, description = "Page results page size, default 10, max 50"),
@@ -65,11 +78,12 @@ pub async fn search(
     user: TackUser,
     Query(query): Query<SearchQuery>,
 ) -> AppResult<Json<SearchResults>> {
+    let organization_id = resolve_team_organization(&user, query.team_id)?;
     let caller = SearchCaller {
         user_id: user.user_id,
         is_admin: user.is_admin,
-        team_ids: user.teams.keys().copied().collect(),
-        organization_ids: user.organization_ids(),
+        team_id: query.team_id,
+        organization_id,
     };
     let hits = state.search.search(&query.q, &caller, state.embedder.as_ref()).await?;
 

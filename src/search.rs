@@ -313,33 +313,30 @@ impl SearchClient {
         caller: &SearchCaller,
         embedder: Option<&Embedder>,
     ) -> Result<Vec<SearchHit>> {
-        let acl_filter = caller.acl_filter();
+        // Always non-empty now (at minimum, the team/org scope clause) --
+        // there is no more "admin means no filter at all" case, see
+        // `SearchCaller::filters`' doc comment.
+        let filters = caller.filters();
         // Highlights the same field being matched -- fragments come back as
         // `hit.highlight.text`, `<em>`-wrapped by default (no custom
         // pre/post tags configured; the frontend swaps them for its own
         // <mark> rendering rather than trusting raw HTML from here).
         let highlight = json!({ "fields": { "text": {} } });
 
-        let lexical_query = match &acl_filter {
-            Some(filter) => json!({
-                "size": RAW_FETCH_SIZE,
-                "query": { "bool": { "must": [{ "match": { "text": query_text } }], "filter": [filter] } },
-                "highlight": highlight
-            }),
-            None => json!({
-                "size": RAW_FETCH_SIZE,
-                "query": { "match": { "text": query_text } },
-                "highlight": highlight
-            }),
-        };
+        let lexical_query = json!({
+            "size": RAW_FETCH_SIZE,
+            "query": { "bool": { "must": [{ "match": { "text": query_text } }], "filter": filters } },
+            "highlight": highlight
+        });
         let lexical_hits = self.raw_search(lexical_query).await?;
 
         let knn_hits = if let Some(embedder) = embedder {
             let vector = embedder.embed_query(query_text).await?;
-            let mut knn_field = json!({ "vector": vector, "k": RAW_FETCH_SIZE });
-            if let Some(filter) = &acl_filter {
-                knn_field["filter"] = filter.clone();
-            }
+            let knn_field = json!({
+                "vector": vector,
+                "k": RAW_FETCH_SIZE,
+                "filter": { "bool": { "filter": filters } }
+            });
             // A pure-semantic match can share zero literal terms with the
             // query, so this highlight is frequently empty -- the frontend
             // falls back to a plain truncated `text` prefix in that case,
@@ -411,58 +408,74 @@ fn reciprocal_rank_fusion(lexical: Vec<RawHit>, knn: Vec<RawHit>) -> Vec<SearchH
     results
 }
 
-/// The caller's identity/membership, used to build the search ACL filter —
-/// the OpenSearch-side mirror of `handlers::notes::can_view`, since search
-/// results must respect exactly the same visibility rules as direct reads.
+/// The caller's identity/membership, used to build the search filters — one
+/// specific team and its organization, not "every team/org the caller
+/// belongs to" the way this used to work. Search is scoped to the active
+/// team, same as the Notes tab (`GET /notes?team_id=`) -- searching used to
+/// silently span every team you're in, which read as a visibility bug (a
+/// hit from an unrelated team showing up with no indication why) even
+/// though the underlying per-note ACL enforcement was always correct.
+/// `handlers::search::search` resolves `team_id`/`organization_id` via
+/// `notes_acl::resolve_team_organization`, the same membership check every
+/// other team-scoped write (`create_note`, etc.) already uses -- including
+/// for an admin caller, who must still actually belong to the team being
+/// searched, exactly like `GET /notes` never bypasses its own `team_id`
+/// filter for admins either.
 pub struct SearchCaller {
     pub user_id: Uuid,
     pub is_admin: bool,
-    pub team_ids: Vec<Uuid>,
-    pub organization_ids: Vec<Uuid>,
+    pub team_id: Uuid,
+    pub organization_id: Uuid,
 }
 
 impl SearchCaller {
-    /// `None` means "no filter" (admin — sees everything).
-    fn acl_filter(&self) -> Option<Value> {
-        if self.is_admin {
-            return None;
-        }
-        let mut should = vec![json!({ "term": { "created_by": self.user_id } })];
-        if !self.team_ids.is_empty() {
-            should.push(json!({
-                "bool": {
-                    "must": [
-                        { "term": { "visibility": Visibility::Team.as_db_str() } },
-                        { "terms": { "team_id": self.team_ids } }
-                    ]
-                }
-            }));
-        }
-        if !self.organization_ids.is_empty() {
-            should.push(json!({
-                "bool": {
-                    "must": [
-                        { "term": { "visibility": Visibility::Organization.as_db_str() } },
-                        { "terms": { "organization_id": self.organization_ids } }
-                    ]
-                }
-            }));
-            // Coarse pre-filter only -- "any page belonging to one of the
-            // caller's organizations". The real per-page permission check
-            // (ancestor overrides, space membership) happens as a live
-            // post-filter in handlers::search::search, since it can't be
-            // expressed as a static OpenSearch query the way Notes'
-            // visibility enum can.
-            should.push(json!({
-                "bool": {
-                    "must": [
+    /// Always at least one filter (the team/org scope below) -- unlike the
+    /// old design, admin never means "no filter at all": an admin still
+    /// only searches within the one team/org they asked for, they just
+    /// aren't further restricted by each note's own `visibility`.
+    fn filters(&self) -> Vec<Value> {
+        // Every note belongs to exactly one team; every page's own team
+        // lives on its space, not indexed here, so pages are scoped by
+        // organization only (the same coarse pre-filter the previous
+        // design used) -- the real per-page permission check still happens
+        // as a live post-filter in `handlers::search::search`.
+        let scope = json!({
+            "bool": {
+                "should": [
+                    { "bool": { "must": [
+                        { "term": { "content_type": "note" } },
+                        { "term": { "team_id": self.team_id } }
+                    ]}},
+                    { "bool": { "must": [
                         { "term": { "content_type": "page" } },
-                        { "terms": { "organization_id": self.organization_ids } }
-                    ]
-                }
-            }));
+                        { "term": { "organization_id": self.organization_id } }
+                    ]}}
+                ],
+                "minimum_should_match": 1
+            }
+        });
+        if self.is_admin {
+            return vec![scope];
         }
-        Some(json!({ "bool": { "should": should, "minimum_should_match": 1 } }))
+        // Within that already-guaranteed team/org scope, a note is visible
+        // if the caller created it or its visibility isn't 'private' --
+        // 'team'/'organization' notes are always visible here since `scope`
+        // already confirmed the caller belongs to the note's team. Pages
+        // have no `visibility` field at all (their ACL is resolved live,
+        // not statically) -- `must_not: {term: visibility=private}` against
+        // a document missing that field simply passes, so this clause
+        // doesn't need its own separate page branch the way the old design
+        // did.
+        let visibility = json!({
+            "bool": {
+                "should": [
+                    { "term": { "created_by": self.user_id } },
+                    { "bool": { "must_not": { "term": { "visibility": Visibility::Private.as_db_str() } } } }
+                ],
+                "minimum_should_match": 1
+            }
+        });
+        vec![scope, visibility]
     }
 }
 
@@ -556,8 +569,8 @@ struct RawSource {
 mod tests {
     use super::*;
 
-    fn caller(is_admin: bool, team_ids: Vec<Uuid>, organization_ids: Vec<Uuid>) -> SearchCaller {
-        SearchCaller { user_id: Uuid::new_v4(), is_admin, team_ids, organization_ids }
+    fn caller(is_admin: bool, team_id: Uuid, organization_id: Uuid) -> SearchCaller {
+        SearchCaller { user_id: Uuid::new_v4(), is_admin, team_id, organization_id }
     }
 
     fn hit(content_id: Uuid, text: &str) -> RawHit {
@@ -576,47 +589,42 @@ mod tests {
     }
 
     #[test]
-    fn admin_gets_no_filter() {
-        assert!(caller(true, vec![], vec![]).acl_filter().is_none());
-    }
-
-    #[test]
-    fn non_admin_always_gets_a_filter_even_with_no_teams_or_orgs() {
-        // Still must be able to find their own private notes.
-        let filter = caller(false, vec![], vec![]).acl_filter().unwrap();
-        let should = filter["bool"]["should"].as_array().unwrap();
-        assert_eq!(should.len(), 1, "only the created_by clause, no team/org clauses");
-    }
-
-    #[test]
-    fn non_admin_with_teams_and_orgs_gets_all_four_should_clauses() {
-        let filter = caller(false, vec![Uuid::new_v4()], vec![Uuid::new_v4()]).acl_filter().unwrap();
-        let should = filter["bool"]["should"].as_array().unwrap();
-        assert_eq!(
-            should.len(),
-            4,
-            "created_by + team clause + organization clause + page-organization-membership clause"
-        );
-    }
-
-    #[test]
-    fn organization_member_gets_a_coarse_page_should_clause() {
-        let org_id = Uuid::new_v4();
-        let filter = caller(false, vec![], vec![org_id]).acl_filter().unwrap();
-        let should = filter["bool"]["should"].as_array().unwrap();
-        let page_clause = &should[2];
-        assert_eq!(page_clause["bool"]["must"][0]["term"]["content_type"], "page");
-        assert_eq!(page_clause["bool"]["must"][1]["terms"]["organization_id"][0], org_id.to_string());
-    }
-
-    #[test]
-    fn team_clause_scopes_to_team_visibility_and_the_callers_team_ids() {
+    fn admin_still_gets_the_team_org_scope_filter() {
         let team_id = Uuid::new_v4();
-        let filter = caller(false, vec![team_id], vec![]).acl_filter().unwrap();
-        let should = filter["bool"]["should"].as_array().unwrap();
-        let team_clause = &should[1];
-        assert_eq!(team_clause["bool"]["must"][0]["term"]["visibility"], "team");
-        assert_eq!(team_clause["bool"]["must"][1]["terms"]["team_id"][0], team_id.to_string());
+        let org_id = Uuid::new_v4();
+        let filters = caller(true, team_id, org_id).filters();
+        assert_eq!(filters.len(), 1, "scope only -- no visibility clause for an admin");
+        let scope = &filters[0];
+        let should = scope["bool"]["should"].as_array().unwrap();
+        assert_eq!(should[0]["bool"]["must"][1]["term"]["team_id"], team_id.to_string());
+        assert_eq!(should[1]["bool"]["must"][1]["term"]["organization_id"], org_id.to_string());
+    }
+
+    #[test]
+    fn non_admin_gets_scope_plus_visibility_filter() {
+        let filters = caller(false, Uuid::new_v4(), Uuid::new_v4()).filters();
+        assert_eq!(filters.len(), 2, "scope clause + visibility clause");
+        let visibility_should = filters[1]["bool"]["should"].as_array().unwrap();
+        assert_eq!(visibility_should.len(), 2, "created_by clause + not-private clause");
+    }
+
+    #[test]
+    fn scope_filter_restricts_notes_by_team_and_pages_by_organization() {
+        let team_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = &caller(false, team_id, org_id).filters()[0];
+        let should = scope["bool"]["should"].as_array().unwrap();
+        assert_eq!(should[0]["bool"]["must"][0]["term"]["content_type"], "note");
+        assert_eq!(should[0]["bool"]["must"][1]["term"]["team_id"], team_id.to_string());
+        assert_eq!(should[1]["bool"]["must"][0]["term"]["content_type"], "page");
+        assert_eq!(should[1]["bool"]["must"][1]["term"]["organization_id"], org_id.to_string());
+    }
+
+    #[test]
+    fn visibility_filter_excludes_private_unless_the_caller_created_it() {
+        let filters = caller(false, Uuid::new_v4(), Uuid::new_v4()).filters();
+        let visibility = &filters[1]["bool"]["should"][1];
+        assert_eq!(visibility["bool"]["must_not"]["term"]["visibility"], "private");
     }
 
     #[test]
