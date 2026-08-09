@@ -85,19 +85,40 @@ pub async fn get_folder_admin_any_org(pool: &Pool, id: Uuid) -> Result<Option<No
 /// Folders visible to the caller: every folder belonging to any of their
 /// teams, within one organization (mirrors `spaces::list_spaces_for_teams`'
 /// per-organization call shape).
+/// Paginated within *this* organization -- the handler loops one call per
+/// organization the caller belongs to (same shape as every other
+/// per-organization list in this API) and sums the totals, so a caller with
+/// folders spread across multiple organizations sees `limit` folders from
+/// *each* org per page rather than one true globally-ordered page. A
+/// documented tradeoff, not an oversight: merging and re-slicing across
+/// organizations would need a fan-out query this API doesn't otherwise do
+/// anywhere, for a case (a caller's folders split across orgs) that's rare
+/// in practice.
 pub async fn list_folders_for_teams(
     pool: &Pool,
     organization_id: Uuid,
     team_ids: &[Uuid],
     caller_id: Uuid,
-) -> Result<Vec<NoteFolder>, AppError> {
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<NoteFolder>, i64), AppError> {
     let client = pool.get().await?;
     let sql = format!(
-        "{} WHERE f.organization_id = $1 AND f.team_id = ANY($2) ORDER BY lower(f.name) ASC",
+        "{} WHERE f.organization_id = $1 AND f.team_id = ANY($2) ORDER BY lower(f.name) ASC LIMIT $4 OFFSET $5",
         FOLDER_SELECT.replace("{caller_id}", "$3")
     );
-    let rows = client.query(&sql, &[&organization_id, &team_ids, &caller_id]).await?;
-    Ok(rows.iter().map(row_to_folder).collect())
+    let rows = client.query(&sql, &[&organization_id, &team_ids, &caller_id, &limit, &offset]).await?;
+    let folders = rows.iter().map(row_to_folder).collect();
+
+    let total: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM note_folders WHERE organization_id = $1 AND team_id = ANY($2)",
+            &[&organization_id, &team_ids],
+        )
+        .await?
+        .get(0);
+
+    Ok((folders, total))
 }
 
 pub async fn rename_folder(pool: &Pool, folder: &NoteFolder, name: &str, caller_id: Uuid) -> Result<NoteFolder, AppError> {

@@ -71,6 +71,9 @@ pub struct NotesPage {
     /// `true` if there are more notes beyond this page (requesting the next
     /// `offset` will return further results).
     pub has_more: bool,
+    /// Total notes matching the query, ignoring `limit`/`offset` -- lets the
+    /// frontend render "Page N of M", not just "there might be more."
+    pub total: i64,
 }
 
 /// Attaches a note to an entity owned by another service (e.g. a lagan pull
@@ -221,6 +224,13 @@ pub struct CreateNoteFolderRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateNoteFolderRequest {
     pub name: String,
+}
+
+/// A page of a team's Notes folders. Same `total` convention as `NotesPage`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NoteFoldersPage {
+    pub folders: Vec<NoteFolder>,
+    pub total: i64,
 }
 
 #[cfg(test)]

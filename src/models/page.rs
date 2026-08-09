@@ -34,6 +34,14 @@ pub struct UpdateSpaceRequest {
     pub name: String,
 }
 
+/// A page of spaces visible to the caller. Same `total` convention as
+/// `NotesPage`/`NoteFoldersPage`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SpacesPage {
+    pub spaces: Vec<Space>,
+    pub total: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionLevel {
@@ -101,6 +109,16 @@ pub struct Page {
     /// Number of direct children — lets a tree UI show an expand affordance
     /// without a separate fetch, same reasoning as `Note.reply_count`.
     pub child_count: i64,
+}
+
+/// A page of one tree level's *visible* pages. Same `total` convention as
+/// `NotesPage`/`NoteFoldersPage`/`SpacesPage` -- see
+/// `handlers::pages::list_pages` for why `total` here counts the
+/// post-ACL-filter visible set, not every raw child row.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PagesPage {
+    pub pages: Vec<Page>,
+    pub total: i64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

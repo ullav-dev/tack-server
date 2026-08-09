@@ -10,7 +10,7 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::page::{
     CreatePageReferenceRequest, CreatePagePermissionRequest, CreatePageRequest, Page, PageBacklink, PagePermission,
-    PagePermissionLevelResponse, PageReference, PageRevision, UpdatePageRequest,
+    PagePermissionLevelResponse, PageReference, PageRevision, PagesPage, UpdatePageRequest,
 };
 use crate::pages_acl::{
     can_create_in_space, can_view, require_edit, resolve_effective_permission, resolve_space, resolve_visible_page,
@@ -65,21 +65,45 @@ pub async fn create_page(
     Ok(Json(page))
 }
 
+const DEFAULT_PAGES_LIMIT: i64 = 25;
+const MAX_PAGES_LIMIT: i64 = 100;
+
 #[derive(Debug, Deserialize)]
 pub struct ListPagesQuery {
     /// Omit to list root pages (pages with no parent) in the space.
     pub parent_id: Option<Uuid>,
+    /// Defaults to 25, capped at 100.
+    pub limit: Option<i64>,
+    /// Defaults to 0.
+    pub offset: Option<i64>,
 }
 
 /// Direct children of `parent_id` in this space (or root pages if omitted),
-/// filtered to only the ones the caller can view. Each candidate's
-/// permission is resolved individually — a child page's own override can
-/// make it more (or less) restricted than its siblings.
+/// filtered to only the ones the caller can view, then paginated.
+///
+/// Each candidate's permission is resolved individually — a child page's
+/// own override can make it more (or less) restricted than its siblings —
+/// which means the ACL filter can't be pushed into `db::pages::list_children`'s
+/// SQL the way Notes' visibility enum can (same limitation
+/// `handlers::search::search` already documents for page search hits).
+/// A true `LIMIT`/`OFFSET` at the SQL layer would paginate *before* that
+/// filter removes rows, undercounting a page. So this fetches every direct
+/// child of `parent_id` (bounded by realistic authoring — nobody creates a
+/// huge flat sibling list under one page in practice, and Confluence itself
+/// doesn't paginate a page's children either, for the same structural
+/// reason), resolves each one's live permission, *then* slices the visible
+/// set for `limit`/`offset`. The API still gets a real `limit`/`offset`/
+/// `total` contract identical to the other three paginated lists; only the
+/// internal implementation fetches more than one page's worth up front.
 #[utoipa::path(
     get,
     path = "/spaces/{id}/pages",
-    params(("parent_id" = Option<Uuid>, Query, description = "List children of this page, or root pages if omitted")),
-    responses((status = 200, description = "Visible pages at this level of the tree", body = [Page])),
+    params(
+        ("parent_id" = Option<Uuid>, Query, description = "List children of this page, or root pages if omitted"),
+        ("limit" = Option<i64>, Query, description = "Page size, default 25, max 100"),
+        ("offset" = Option<i64>, Query, description = "Offset into the (alphabetical) visible list, default 0"),
+    ),
+    responses((status = 200, description = "A page of visible pages at this level of the tree", body = PagesPage)),
     tag = "pages"
 )]
 pub async fn list_pages(
@@ -87,7 +111,7 @@ pub async fn list_pages(
     user: TackUser,
     Path(space_id): Path<Uuid>,
     Query(query): Query<ListPagesQuery>,
-) -> AppResult<Json<Vec<Page>>> {
+) -> AppResult<Json<PagesPage>> {
     let space = resolve_space(&state.db, &user, space_id).await?;
     let candidates = db::pages::list_children(&state.db, space.organization_id, space_id, query.parent_id).await?;
 
@@ -98,7 +122,12 @@ pub async fn list_pages(
             visible.push(page);
         }
     }
-    Ok(Json(visible))
+
+    let total = visible.len() as i64;
+    let limit = query.limit.unwrap_or(DEFAULT_PAGES_LIMIT).clamp(1, MAX_PAGES_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let pages = visible.into_iter().skip(offset as usize).take(limit as usize).collect();
+    Ok(Json(PagesPage { pages, total }))
 }
 
 #[utoipa::path(
