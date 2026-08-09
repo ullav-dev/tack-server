@@ -93,7 +93,7 @@ pub async fn list_folders_for_teams(
 ) -> Result<Vec<NoteFolder>, AppError> {
     let client = pool.get().await?;
     let sql = format!(
-        "{} WHERE f.organization_id = $1 AND f.team_id = ANY($2) ORDER BY f.name ASC",
+        "{} WHERE f.organization_id = $1 AND f.team_id = ANY($2) ORDER BY lower(f.name) ASC",
         FOLDER_SELECT.replace("{caller_id}", "$3")
     );
     let rows = client.query(&sql, &[&organization_id, &team_ids, &caller_id]).await?;

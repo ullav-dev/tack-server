@@ -29,6 +29,11 @@ pub struct CreateSpaceRequest {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateSpaceRequest {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionLevel {

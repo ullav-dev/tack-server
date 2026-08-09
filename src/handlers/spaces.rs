@@ -1,10 +1,14 @@
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
+use uuid::Uuid;
 
 use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::page::{CreateSpaceRequest, Space};
-use crate::pages_acl::resolve_team_organization;
+use crate::models::page::{CreateSpaceRequest, Space, UpdateSpaceRequest};
+use crate::pages_acl::{can_create_in_space, resolve_space, resolve_team_organization};
 use crate::AppState;
 
 #[utoipa::path(
@@ -42,4 +46,33 @@ pub async fn list_spaces(State(state): State<AppState>, user: TackUser) -> AppRe
         spaces.extend(db::spaces::list_spaces_for_teams(&state.db, org_id, &team_ids).await?);
     }
     Ok(Json(spaces))
+}
+
+/// Renames a space. Reuses `pages_acl::can_create_in_space`'s "space
+/// default Edit level" check -- the same rule that already gates creating a
+/// root page directly under the space, since there's no finer-grained
+/// space-level permission model than that.
+#[utoipa::path(
+    patch,
+    path = "/spaces/{id}",
+    request_body = UpdateSpaceRequest,
+    responses((status = 200, description = "Renamed space", body = Space)),
+    tag = "pages"
+)]
+pub async fn update_space(
+    State(state): State<AppState>,
+    user: TackUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateSpaceRequest>,
+) -> AppResult<Json<Space>> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("name must not be empty".into()));
+    }
+    let space = resolve_space(&state.db, &user, id).await?;
+    if !can_create_in_space(&space, &user) {
+        return Err(AppError::Forbidden("You don't have edit access to this space.".into()));
+    }
+    let updated = db::spaces::rename_space(&state.db, space.id, space.organization_id, name).await?;
+    Ok(Json(updated))
 }
