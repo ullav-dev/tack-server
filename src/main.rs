@@ -105,6 +105,8 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::note::CreateNoteFolderRequest,
         models::note::UpdateNoteFolderRequest,
         search::SearchHit,
+        search::SearchTypeResults,
+        search::SearchResults,
         models::page::Space,
         models::page::CreateSpaceRequest,
         models::page::UpdateSpaceRequest,

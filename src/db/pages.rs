@@ -108,6 +108,16 @@ pub async fn get_page_admin_any_org(pool: &Pool, id: Uuid) -> Result<Option<Page
     Ok(row.as_ref().map(row_to_page))
 }
 
+/// Every non-deleted page (any organization, any space), `LIMIT`/`OFFSET`
+/// paged -- mirrors `notes::list_all_for_backfill`, same `tack-indexer
+/// --backfill`-only use.
+pub async fn list_all_for_backfill(pool: &Pool, limit: i64, offset: i64) -> Result<Vec<Page>, AppError> {
+    let client = pool.get().await?;
+    let sql = format!("{PAGE_SELECT} WHERE p.deleted_at IS NULL ORDER BY p.id LIMIT $1 OFFSET $2");
+    let rows = client.query(&sql, &[&limit, &offset]).await?;
+    Ok(rows.iter().map(row_to_page).collect())
+}
+
 /// Direct children of `parent_id` in a space, or root pages if `parent_id`
 /// is `None`. Permission filtering happens in the handler (each candidate
 /// page's effective permission must be resolved individually — see
