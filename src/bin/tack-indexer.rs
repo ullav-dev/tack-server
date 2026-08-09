@@ -17,6 +17,18 @@
 //! Wake-up is a fixed short poll interval, not `LISTEN`/`NOTIFY` — a real
 //! latency optimization for later, not a correctness gap now (a 2s poll
 //! already gives near-real-time indexing for this stage).
+//!
+//! `--backfill`: a separate, rerunnable one-shot mode (not a new binary --
+//! reuses this one's config/pool/embedder setup) that walks every
+//! non-deleted note and page and re-indexes it, instead of only reacting to
+//! future outbox events. Exists because adding a new indexed field (e.g.
+//! `title`, `folder_id`, `space_id`, `parent_id` -- see `search.rs`) never
+//! retroactively populates *already-indexed* documents; without this, that
+//! content just never gets those fields until it happens to be edited
+//! again. Safe to run any time and as many times as needed: indexing is
+//! already an idempotent upsert keyed by content id, this mode doesn't
+//! touch `outbox_events` at all, and it runs fully independently of (and
+//! can overlap with) the normal poll loop.
 
 use anyhow::Result;
 use std::time::Duration;
@@ -26,6 +38,7 @@ use uuid::Uuid;
 
 const BATCH_SIZE: i64 = 20;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const BACKFILL_BATCH_SIZE: i64 = 100;
 
 struct OutboxEvent {
     id: Uuid,
@@ -70,6 +83,10 @@ async fn main() -> Result<()> {
         }
     };
 
+    if std::env::args().any(|a| a == "--backfill") {
+        return run_backfill(&pool, &search, embedder.as_ref()).await;
+    }
+
     tracing::info!("tack-indexer started, polling every {POLL_INTERVAL:?}");
 
     loop {
@@ -81,6 +98,60 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
         }
+    }
+}
+
+/// Walks every non-deleted note, then every non-deleted page, re-indexing
+/// each -- see this file's module doc comment for why this exists and why
+/// it's safe to rerun. Logs progress every batch and a final summary;
+/// exits non-zero (via the error return) if any batch's *fetch* fails, but
+/// a single document's indexing failure is logged and skipped rather than
+/// aborting the whole run, so one bad row can't block backfilling
+/// everything after it.
+async fn run_backfill(pool: &db::DbPool, search: &SearchClient, embedder: Option<&Embedder>) -> Result<()> {
+    let notes_indexed = backfill_notes(pool, search, embedder).await?;
+    let pages_indexed = backfill_pages(pool, search, embedder).await?;
+    tracing::info!("backfill complete: {notes_indexed} note(s), {pages_indexed} page(s) re-indexed");
+    Ok(())
+}
+
+async fn backfill_notes(pool: &db::DbPool, search: &SearchClient, embedder: Option<&Embedder>) -> Result<usize> {
+    let mut offset = 0;
+    let mut total = 0;
+    loop {
+        let notes = db::notes::list_all_for_backfill(pool, BACKFILL_BATCH_SIZE, offset).await?;
+        if notes.is_empty() {
+            return Ok(total);
+        }
+        for note in &notes {
+            if let Err(e) = search.index_note(note, embedder).await {
+                tracing::error!("backfill: failed to index note {}: {e:#}", note.id);
+            } else {
+                total += 1;
+            }
+        }
+        tracing::info!("backfill: {total} note(s) indexed so far");
+        offset += BACKFILL_BATCH_SIZE;
+    }
+}
+
+async fn backfill_pages(pool: &db::DbPool, search: &SearchClient, embedder: Option<&Embedder>) -> Result<usize> {
+    let mut offset = 0;
+    let mut total = 0;
+    loop {
+        let pages = db::pages::list_all_for_backfill(pool, BACKFILL_BATCH_SIZE, offset).await?;
+        if pages.is_empty() {
+            return Ok(total);
+        }
+        for page in &pages {
+            if let Err(e) = search.index_page(page, embedder).await {
+                tracing::error!("backfill: failed to index page {}: {e:#}", page.id);
+            } else {
+                total += 1;
+            }
+        }
+        tracing::info!("backfill: {total} page(s) indexed so far");
+        offset += BACKFILL_BATCH_SIZE;
     }
 }
 

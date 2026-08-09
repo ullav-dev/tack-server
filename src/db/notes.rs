@@ -347,6 +347,20 @@ pub async fn get_note_admin_any_org(pool: &Pool, id: Uuid) -> Result<Option<Note
     Ok(row.as_ref().map(row_to_note))
 }
 
+/// Every non-deleted note (any organization, any team), `LIMIT`/`OFFSET`
+/// paged -- for `tack-indexer --backfill` only, walking the whole table to
+/// (re-)index content that predates a search schema change (e.g. this
+/// wasn't indexed with `title`/`folder_id` until the query/mapping that
+/// introduced them). Not a hot path -- an occasional maintenance operation,
+/// so plain offset pagination (not keyset) is fine, same tradeoff every
+/// other list in this API already makes.
+pub async fn list_all_for_backfill(pool: &Pool, limit: i64, offset: i64) -> Result<Vec<Note>, AppError> {
+    let client = pool.get().await?;
+    let sql = format!("{NOTE_SELECT} WHERE n.deleted_at IS NULL ORDER BY n.id LIMIT $1 OFFSET $2");
+    let rows = client.query(&sql, &[&limit, &offset]).await?;
+    Ok(rows.iter().map(row_to_note).collect())
+}
+
 /// Narrows `list_team_notes` by folder. `None` (the default, via
 /// `GET /notes?team_id=` with no folder params) preserves the original
 /// unfiltered behavior -- every existing caller (`NotesList.tsx`, the MCP

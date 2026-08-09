@@ -31,6 +31,14 @@ pub const CONTENT_INDEX: &str = "tack-content";
 /// original RRF paper; not sensitive to tuning for a first pass.
 const RRF_K: f64 = 60.0;
 
+/// Raw candidates fetched per sub-query (lexical, and separately kNN)
+/// before fusion/dedup/pagination. Comfortably covers several pages'
+/// worth of *deduped* results (chunks of the same note collapse to one
+/// hit), which is the actual depth anyone pages through in a search UI --
+/// not an attempt at exhaustive pagination over every matching document,
+/// which no search engine does either.
+const RAW_FETCH_SIZE: i64 = 200;
+
 #[derive(Clone)]
 pub struct SearchClient {
     base_url: String,
@@ -45,6 +53,20 @@ impl SearchClient {
     /// Creates the content index with its mapping, if it doesn't already exist.
     /// Safe to call on every startup (matches the Postgres migrations'
     /// idempotent-on-every-run convention).
+    ///
+    /// Only applies to a *new* index -- an already-existing one (e.g. any
+    /// pre-existing dev/prod deployment) keeps whatever mapping it already
+    /// has, since this never issues a `PUT _mapping` against an existing
+    /// index. That's not a functional gap for the newer fields added here
+    /// (`title`/`folder_id`/`space_id`/`parent_id`): the index has no
+    /// `"dynamic": false`, so OpenSearch's default dynamic mapping picks
+    /// them up automatically the first time a document carrying them is
+    /// indexed, just with auto-inferred types (`text` + a `.keyword`
+    /// sub-field) rather than this file's explicit ones -- fine here since
+    /// nothing filters/aggregates on them, only displays them. `title`
+    /// showing up on *already-indexed* content still needs the backfill
+    /// (`tack-indexer --backfill`) -- a new mapping field doesn't retroactively
+    /// populate old documents.
     pub async fn ensure_index(&self) -> Result<()> {
         let url = format!("{}/{CONTENT_INDEX}", self.base_url);
         let exists = self.http.head(&url).send().await?.status().is_success();
@@ -69,8 +91,12 @@ impl SearchClient {
                     "visibility":      { "type": "keyword" },
                     "created_by":      { "type": "keyword" },
                     "language":        { "type": "keyword" },
+                    "title":           { "type": "text" },
                     "text":            { "type": "text" },
                     "chunk_index":     { "type": "integer" },
+                    "folder_id":       { "type": "keyword" },
+                    "space_id":        { "type": "keyword" },
+                    "parent_id":       { "type": "keyword" },
                     "embedding": {
                         "type": "knn_vector",
                         "dimension": EMBEDDING_DIMENSION,
@@ -124,8 +150,22 @@ impl SearchClient {
                 "visibility": note.visibility.as_db_str(),
                 "created_by": note.created_by,
                 "language": "en",
+                // Empty for a reply -- only top-level notes have a title
+                // (see `Note::title`'s own doc comment). A reply hit still
+                // shows in results via `text`/highlighting; the frontend
+                // resolves it to its parent thread's title via `parent_id`.
+                "title": note.title,
                 "text": chunk_text,
                 "chunk_index": chunk_index,
+                // `folder_id` is only ever set on a top-level note (server-
+                // enforced by a CHECK constraint, see 008_note_folders.sql),
+                // so a reply's is always null here too -- matches its own
+                // `folder_id` field exactly.
+                "folder_id": note.folder_id,
+                // Null for a top-level note, the parent's id for a reply --
+                // this is what lets a reply hit link to its actual thread
+                // instead of opening the reply as if it were standalone.
+                "parent_id": note.parent_id,
                 "created_at": note.created_at.to_rfc3339(),
                 "updated_at": note.updated_at.to_rfc3339(),
             });
@@ -145,8 +185,20 @@ impl SearchClient {
     /// Removes all of a note's chunk documents (soft-delete in Postgres ->
     /// hard removal from search, since deleted content should never surface
     /// in results).
+    ///
+    /// `?conflicts=proceed` -- found live while running the backfill tool
+    /// against real data: `_delete_by_query`'s default (`conflicts=abort`)
+    /// aborts the *entire* operation the moment any one matched document's
+    /// seqNo has moved since the query's internal search phase (e.g. a
+    /// concurrent reindex of the same content elsewhere), surfacing as a 409
+    /// even though the delete itself is small and idempotent to just retry.
+    /// `proceed` skips conflicting documents instead of aborting -- correct
+    /// here because every caller of `delete_note`/`delete_page` already
+    /// treats "nothing left to delete" as success, and a genuinely-left-over
+    /// chunk from a lost race gets cleaned up by that content's own next
+    /// index/delete event (or the next `--backfill` run) regardless.
     pub async fn delete_note(&self, note_id: Uuid) -> Result<()> {
-        let url = format!("{}/{CONTENT_INDEX}/_delete_by_query", self.base_url);
+        let url = format!("{}/{CONTENT_INDEX}/_delete_by_query?conflicts=proceed", self.base_url);
         let query = json!({
             "query": { "bool": { "must": [
                 { "term": { "content_type": "note" } },
@@ -194,8 +246,12 @@ impl SearchClient {
                 "organization_id": page.organization_id,
                 "created_by": page.created_by,
                 "language": "en",
+                "title": page.title,
                 "text": chunk_text,
                 "chunk_index": chunk_index,
+                // The one field the frontend was missing to build a page
+                // hit's own `/spaces/:spaceId/pages/:pageId` link at all.
+                "space_id": page.space_id,
                 "created_at": page.created_at.to_rfc3339(),
                 "updated_at": page.updated_at.to_rfc3339(),
             });
@@ -219,9 +275,10 @@ impl SearchClient {
     }
 
     /// Removes all of a page's chunk documents (soft-delete in Postgres ->
-    /// hard removal from search).
+    /// hard removal from search). `?conflicts=proceed` -- see `delete_note`'s
+    /// doc comment for why.
     pub async fn delete_page(&self, page_id: Uuid) -> Result<()> {
-        let url = format!("{}/{CONTENT_INDEX}/_delete_by_query", self.base_url);
+        let url = format!("{}/{CONTENT_INDEX}/_delete_by_query?conflicts=proceed", self.base_url);
         let query = json!({
             "query": { "bool": { "must": [
                 { "term": { "content_type": "page" } },
@@ -244,6 +301,12 @@ impl SearchClient {
     /// computed live from their current team/organization memberships.
     /// Multiple chunks of the same note are deduped to one result (its
     /// best-ranked chunk represents it).
+    /// Returns the fused, deduped hit list -- unpaginated (bounded by
+    /// `RAW_FETCH_SIZE` per sub-query, not by any caller-supplied
+    /// limit/offset). `handlers::search::search` does the page-ACL
+    /// post-filter, then splits this by content type and paginates each
+    /// half independently -- see that function's own doc comment for why
+    /// pagination happens there and not here.
     pub async fn search(
         &self,
         query_text: &str,
@@ -251,23 +314,38 @@ impl SearchClient {
         embedder: Option<&Embedder>,
     ) -> Result<Vec<SearchHit>> {
         let acl_filter = caller.acl_filter();
+        // Highlights the same field being matched -- fragments come back as
+        // `hit.highlight.text`, `<em>`-wrapped by default (no custom
+        // pre/post tags configured; the frontend swaps them for its own
+        // <mark> rendering rather than trusting raw HTML from here).
+        let highlight = json!({ "fields": { "text": {} } });
 
         let lexical_query = match &acl_filter {
             Some(filter) => json!({
-                "size": 50,
-                "query": { "bool": { "must": [{ "match": { "text": query_text } }], "filter": [filter] } }
+                "size": RAW_FETCH_SIZE,
+                "query": { "bool": { "must": [{ "match": { "text": query_text } }], "filter": [filter] } },
+                "highlight": highlight
             }),
-            None => json!({ "size": 50, "query": { "match": { "text": query_text } } }),
+            None => json!({
+                "size": RAW_FETCH_SIZE,
+                "query": { "match": { "text": query_text } },
+                "highlight": highlight
+            }),
         };
         let lexical_hits = self.raw_search(lexical_query).await?;
 
         let knn_hits = if let Some(embedder) = embedder {
             let vector = embedder.embed_query(query_text).await?;
-            let mut knn_field = json!({ "vector": vector, "k": 50 });
+            let mut knn_field = json!({ "vector": vector, "k": RAW_FETCH_SIZE });
             if let Some(filter) = &acl_filter {
                 knn_field["filter"] = filter.clone();
             }
-            let knn_query = json!({ "size": 50, "query": { "knn": { "embedding": knn_field } } });
+            // A pure-semantic match can share zero literal terms with the
+            // query, so this highlight is frequently empty -- the frontend
+            // falls back to a plain truncated `text` prefix in that case,
+            // not a missing snippet.
+            let knn_query =
+                json!({ "size": RAW_FETCH_SIZE, "query": { "knn": { "embedding": knn_field } }, "highlight": highlight });
             self.raw_search(knn_query).await?
         } else {
             Vec::new()
@@ -321,7 +399,12 @@ fn reciprocal_rank_fusion(lexical: Vec<RawHit>, knn: Vec<RawHit>) -> Vec<SearchH
             content_id: hit.source.content_id,
             content_type: hit.source.content_type,
             score: score as f32,
+            title: hit.source.title,
             text: hit.source.text,
+            highlight: hit.highlight.map(|h| h.text).unwrap_or_default(),
+            folder_id: hit.source.folder_id,
+            space_id: hit.source.space_id,
+            parent_id: hit.source.parent_id,
         })
         .collect();
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -388,7 +471,46 @@ pub struct SearchHit {
     pub content_id: Uuid,
     pub content_type: String,
     pub score: f32,
+    /// Empty for a reply (see `Note::title`) -- the frontend falls back to
+    /// showing it as "a reply" and links via `parent_id` instead.
+    pub title: String,
+    /// The matched chunk's raw text -- kept as a fallback for when
+    /// `highlight` is empty (a pure-semantic kNN match can share zero
+    /// literal terms with the query, so OpenSearch has nothing to
+    /// highlight), truncated by the frontend for display.
     pub text: String,
+    /// `<em>`-wrapped fragments from OpenSearch's own highlighter, when the
+    /// lexical query actually matched literal terms in this chunk.
+    pub highlight: Vec<String>,
+    /// Set only for a note hit filed in a folder.
+    pub folder_id: Option<Uuid>,
+    /// Set only for a page hit -- what the frontend was missing to build
+    /// `/spaces/:spaceId/pages/:pageId` at all.
+    pub space_id: Option<Uuid>,
+    /// Set only for a reply hit -- the parent (thread root) note's id. The
+    /// frontend links a reply hit to `/notes/{parent_id}`, not
+    /// `/notes/{content_id}` (the reply's own id has no useful standalone
+    /// view).
+    pub parent_id: Option<Uuid>,
+}
+
+/// One content type's slice of a search response -- see `SearchResults`.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct SearchTypeResults {
+    pub hits: Vec<SearchHit>,
+    /// Total matching hits of this type, ignoring `limit`/`offset` -- lets
+    /// the frontend render "Page N of M" per type independently.
+    pub total: i64,
+}
+
+/// `GET /search`'s response: grouped by content type, each type paginated
+/// independently (confirmed design: search stays global across both types
+/// regardless of which Navigator tab is active, results grouped and each
+/// group gets its own pager).
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct SearchResults {
+    pub notes: SearchTypeResults,
+    pub pages: SearchTypeResults,
 }
 
 #[derive(Deserialize)]
@@ -405,13 +527,29 @@ struct SearchHits {
 struct RawHit {
     #[serde(rename = "_source")]
     source: RawSource,
+    #[serde(default)]
+    highlight: Option<RawHighlight>,
+}
+
+#[derive(Deserialize)]
+struct RawHighlight {
+    #[serde(default)]
+    text: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct RawSource {
     content_id: Uuid,
     content_type: String,
+    #[serde(default)]
+    title: String,
     text: String,
+    #[serde(default)]
+    folder_id: Option<Uuid>,
+    #[serde(default)]
+    space_id: Option<Uuid>,
+    #[serde(default)]
+    parent_id: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -423,7 +561,18 @@ mod tests {
     }
 
     fn hit(content_id: Uuid, text: &str) -> RawHit {
-        RawHit { source: RawSource { content_id, content_type: "note".into(), text: text.into() } }
+        RawHit {
+            source: RawSource {
+                content_id,
+                content_type: "note".into(),
+                title: String::new(),
+                text: text.into(),
+                folder_id: None,
+                space_id: None,
+                parent_id: None,
+            },
+            highlight: None,
+        }
     }
 
     #[test]
