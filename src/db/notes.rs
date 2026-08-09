@@ -400,7 +400,34 @@ pub async fn list_team_notes(
     };
     let has_more = rows.len() as i64 > limit;
     let notes = rows.iter().take(limit as usize).map(row_to_note).collect();
-    Ok(crate::models::note::NotesPage { notes, has_more })
+
+    // A separate COUNT(*) against the bare `notes` table (not the
+    // NOTE_SELECT join, which pulls note_bodies/reply_count along for every
+    // row -- wasted work for a query that only needs a number) with the
+    // exact same predicate, so the frontend can render "Page N of M"
+    // instead of just "there might be more." Its own folder clause, not
+    // `folder_clause` above -- that one's `$6` placeholder is only valid
+    // alongside the main query's limit/offset params ($4/$5); this query
+    // has no limit/offset, so a folder id (if any) is `$4` here instead.
+    let count_folder_clause = match folder {
+        None => "",
+        Some(FolderScope::Folder(_)) => "AND n.folder_id = $4",
+        Some(FolderScope::Unfiled) => "AND n.folder_id IS NULL",
+    };
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM notes n
+         WHERE n.organization_id = $1 AND n.team_id = $2 AND n.parent_id IS NULL AND n.deleted_at IS NULL
+           AND (n.visibility != 'private' OR n.created_by = $3)
+           {count_folder_clause}"
+    );
+    let total: i64 = match folder {
+        Some(FolderScope::Folder(folder_id)) => {
+            client.query_one(&count_sql, &[&organization_id, &team_id, &caller_id, &folder_id]).await?.get(0)
+        }
+        _ => client.query_one(&count_sql, &[&organization_id, &team_id, &caller_id]).await?.get(0),
+    };
+
+    Ok(crate::models::note::NotesPage { notes, has_more, total })
 }
 
 pub async fn list_replies(pool: &Pool, parent_id: Uuid, organization_id: Uuid) -> Result<Vec<Note>, AppError> {

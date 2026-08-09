@@ -1,13 +1,14 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::page::{CreateSpaceRequest, Space, UpdateSpaceRequest};
+use crate::models::page::{CreateSpaceRequest, Space, SpacesPage, UpdateSpaceRequest};
 use crate::pages_acl::{can_create_in_space, resolve_space, resolve_team_organization};
 use crate::AppState;
 
@@ -31,21 +32,45 @@ pub async fn create_space(
     Ok(Json(space))
 }
 
+const DEFAULT_SPACES_LIMIT: i64 = 25;
+const MAX_SPACES_LIMIT: i64 = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct ListSpacesQuery {
+    /// Defaults to 25, capped at 100.
+    pub limit: Option<i64>,
+    /// Defaults to 0.
+    pub offset: Option<i64>,
+}
+
 /// Spaces visible to the caller across every organization they belong to
 /// (their own teams' spaces, plus any org-wide space in those organizations).
 #[utoipa::path(
     get,
     path = "/spaces",
-    responses((status = 200, description = "Spaces visible to the caller", body = [Space])),
+    params(
+        ("limit" = Option<i64>, Query, description = "Page size, default 25, max 100"),
+        ("offset" = Option<i64>, Query, description = "Offset into the (alphabetical) list, default 0"),
+    ),
+    responses((status = 200, description = "A page of spaces visible to the caller", body = SpacesPage)),
     tag = "pages"
 )]
-pub async fn list_spaces(State(state): State<AppState>, user: TackUser) -> AppResult<Json<Vec<Space>>> {
+pub async fn list_spaces(
+    State(state): State<AppState>,
+    user: TackUser,
+    Query(query): Query<ListSpacesQuery>,
+) -> AppResult<Json<SpacesPage>> {
     let team_ids: Vec<_> = user.teams.keys().copied().collect();
+    let limit = query.limit.unwrap_or(DEFAULT_SPACES_LIMIT).clamp(1, MAX_SPACES_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
     let mut spaces = Vec::new();
+    let mut total = 0;
     for org_id in user.organization_ids() {
-        spaces.extend(db::spaces::list_spaces_for_teams(&state.db, org_id, &team_ids).await?);
+        let (org_spaces, org_total) = db::spaces::list_spaces_for_teams(&state.db, org_id, &team_ids, limit, offset).await?;
+        spaces.extend(org_spaces);
+        total += org_total;
     }
-    Ok(Json(spaces))
+    Ok(Json(SpacesPage { spaces, total }))
 }
 
 /// Renames a space. Reuses `pages_acl::can_create_in_space`'s "space

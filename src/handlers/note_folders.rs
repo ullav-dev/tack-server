@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::auth::TackUser;
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::note::{CreateNoteFolderRequest, NoteFolder, UpdateNoteFolderRequest};
+use crate::models::note::{CreateNoteFolderRequest, NoteFolder, NoteFoldersPage, UpdateNoteFolderRequest};
 use crate::notes_acl::resolve_team_organization;
 use crate::AppState;
 
@@ -79,26 +79,37 @@ pub async fn create_note_folder(
     Ok(Json(folder))
 }
 
+const DEFAULT_FOLDERS_LIMIT: i64 = 25;
+const MAX_FOLDERS_LIMIT: i64 = 100;
+
 #[derive(Debug, Deserialize)]
 pub struct ListNoteFoldersQuery {
     /// Optional: only this team's folders. Omitted returns every folder
     /// across every Tack-enabled team the caller belongs to, same
     /// "list across all my orgs" shape as `GET /spaces`.
     pub team_id: Option<Uuid>,
+    /// Defaults to 25, capped at 100.
+    pub limit: Option<i64>,
+    /// Defaults to 0.
+    pub offset: Option<i64>,
 }
 
 #[utoipa::path(
     get,
     path = "/note-folders",
-    params(("team_id" = Option<Uuid>, Query, description = "Only this team's folders, if given")),
-    responses((status = 200, description = "Folders visible to the caller", body = [NoteFolder])),
+    params(
+        ("team_id" = Option<Uuid>, Query, description = "Only this team's folders, if given"),
+        ("limit" = Option<i64>, Query, description = "Page size, default 25, max 100"),
+        ("offset" = Option<i64>, Query, description = "Offset into the (alphabetical) list, default 0"),
+    ),
+    responses((status = 200, description = "A page of folders visible to the caller", body = NoteFoldersPage)),
     tag = "notes"
 )]
 pub async fn list_note_folders(
     State(state): State<AppState>,
     user: TackUser,
     Query(query): Query<ListNoteFoldersQuery>,
-) -> AppResult<Json<Vec<NoteFolder>>> {
+) -> AppResult<Json<NoteFoldersPage>> {
     let team_ids: Vec<Uuid> = match query.team_id {
         Some(id) => {
             if !user.teams.contains_key(&id) {
@@ -108,11 +119,17 @@ pub async fn list_note_folders(
         }
         None => user.teams.keys().copied().collect(),
     };
+    let limit = query.limit.unwrap_or(DEFAULT_FOLDERS_LIMIT).clamp(1, MAX_FOLDERS_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
     let mut folders = Vec::new();
+    let mut total = 0;
     for org_id in user.organization_ids() {
-        folders.extend(db::note_folders::list_folders_for_teams(&state.db, org_id, &team_ids, user.user_id).await?);
+        let (org_folders, org_total) =
+            db::note_folders::list_folders_for_teams(&state.db, org_id, &team_ids, user.user_id, limit, offset).await?;
+        folders.extend(org_folders);
+        total += org_total;
     }
-    Ok(Json(folders))
+    Ok(Json(NoteFoldersPage { folders, total }))
 }
 
 #[utoipa::path(

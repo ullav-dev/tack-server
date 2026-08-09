@@ -73,16 +73,30 @@ pub async fn rename_space(pool: &Pool, id: Uuid, organization_id: Uuid, name: &s
 /// any org-wide space (`team_id IS NULL`) in one of their organizations.
 /// Mirrors the same "resolve across each of the caller's orgs" shape as
 /// notes, since a space's organization_id isn't known up front either.
+/// Paginated within *this* organization -- same per-organization-loop
+/// tradeoff documented on `note_folders::list_folders_for_teams`.
 pub async fn list_spaces_for_teams(
     pool: &Pool,
     organization_id: Uuid,
     team_ids: &[Uuid],
-) -> Result<Vec<Space>, AppError> {
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<Space>, i64), AppError> {
     let client = pool.get().await?;
     let sql = format!(
         "{SPACE_SELECT} WHERE organization_id = $1 AND (team_id IS NULL OR team_id = ANY($2))
-         ORDER BY lower(name) ASC"
+         ORDER BY lower(name) ASC LIMIT $3 OFFSET $4"
     );
-    let rows = client.query(&sql, &[&organization_id, &team_ids]).await?;
-    Ok(rows.iter().map(row_to_space).collect())
+    let rows = client.query(&sql, &[&organization_id, &team_ids, &limit, &offset]).await?;
+    let spaces = rows.iter().map(row_to_space).collect();
+
+    let total: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM spaces WHERE organization_id = $1 AND (team_id IS NULL OR team_id = ANY($2))",
+            &[&organization_id, &team_ids],
+        )
+        .await?
+        .get(0);
+
+    Ok((spaces, total))
 }
