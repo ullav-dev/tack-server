@@ -55,6 +55,20 @@ pub async fn get_space_admin_any_org(pool: &Pool, id: Uuid) -> Result<Option<Spa
     Ok(row.as_ref().map(row_to_space))
 }
 
+pub async fn rename_space(pool: &Pool, id: Uuid, organization_id: Uuid, name: &str) -> Result<Space, AppError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            &format!(
+                "UPDATE spaces SET name = $1, updated_at = NOW() WHERE id = $2 AND organization_id = $3
+                 RETURNING id, organization_id, owning_service, team_id, name, created_at, updated_at"
+            ),
+            &[&name, &id, &organization_id],
+        )
+        .await?;
+    row.as_ref().map(row_to_space).ok_or_else(|| AppError::NotFound(format!("Space {id} not found")))
+}
+
 /// Spaces the caller can see: any space belonging to one of their teams, or
 /// any org-wide space (`team_id IS NULL`) in one of their organizations.
 /// Mirrors the same "resolve across each of the caller's orgs" shape as
@@ -67,7 +81,7 @@ pub async fn list_spaces_for_teams(
     let client = pool.get().await?;
     let sql = format!(
         "{SPACE_SELECT} WHERE organization_id = $1 AND (team_id IS NULL OR team_id = ANY($2))
-         ORDER BY name ASC"
+         ORDER BY lower(name) ASC"
     );
     let rows = client.query(&sql, &[&organization_id, &team_ids]).await?;
     Ok(rows.iter().map(row_to_space).collect())

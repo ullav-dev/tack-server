@@ -69,6 +69,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::search::search,
         handlers::spaces::create_space,
         handlers::spaces::list_spaces,
+        handlers::spaces::update_space,
         handlers::pages::create_page,
         handlers::pages::list_pages,
         handlers::pages::get_page,
@@ -105,6 +106,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         search::SearchHit,
         models::page::Space,
         models::page::CreateSpaceRequest,
+        models::page::UpdateSpaceRequest,
         models::page::Page,
         models::page::CreatePageRequest,
         models::page::UpdatePageRequest,
@@ -259,6 +261,7 @@ async fn main() -> Result<()> {
         )
         .route("/search", get(handlers::search::search))
         .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
+        .route("/spaces/:id", axum::routing::patch(handlers::spaces::update_space))
         .route("/spaces/:id/pages", get(handlers::pages::list_pages))
         .route("/pages", post(handlers::pages::create_page))
         .route("/pages/search", get(handlers::pages::search_pages))

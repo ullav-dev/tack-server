@@ -122,11 +122,11 @@ pub async fn list_children(
     let sql = match parent_id {
         Some(_) => format!(
             "{PAGE_SELECT} WHERE p.organization_id = $1 AND p.space_id = $2 AND p.parent_id = $3 AND p.deleted_at IS NULL
-             ORDER BY p.title ASC"
+             ORDER BY lower(p.title) ASC"
         ),
         None => format!(
             "{PAGE_SELECT} WHERE p.organization_id = $1 AND p.space_id = $2 AND p.parent_id IS NULL AND p.deleted_at IS NULL
-             ORDER BY p.title ASC"
+             ORDER BY lower(p.title) ASC"
         ),
     };
     let rows = match parent_id {
