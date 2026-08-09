@@ -78,6 +78,11 @@ fn parse_visibility(s: &str) -> Result<Visibility, rmcp::ErrorData> {
 pub struct SearchContentParams {
     /// Free-text query.
     pub query: String,
+    /// UUID of the team to search within (must be one of the caller's
+    /// Tack-enabled teams) -- search is scoped to one team at a time, same
+    /// as the REST `GET /search` endpoint, so a result can never surface
+    /// from a team the caller didn't ask about.
+    pub team_id: String,
     /// Maximum number of results (default 20).
     pub limit: Option<i64>,
 }
@@ -131,12 +136,9 @@ impl TackMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let user = caller_from_ctx(&context)?;
-        let caller = SearchCaller {
-            user_id: user.user_id,
-            is_admin: user.is_admin,
-            team_ids: user.teams.keys().copied().collect(),
-            organization_ids: user.organization_ids(),
-        };
+        let team_id = parse_uuid(&p.team_id)?;
+        let organization_id = resolve_team_organization(&user, team_id).map_err(app_err)?;
+        let caller = SearchCaller { user_id: user.user_id, is_admin: user.is_admin, team_id, organization_id };
         let hits = self.search.search(&p.query, &caller, self.embedder.as_ref()).await.map_err(app_err)?;
         let limit = p.limit.unwrap_or(20).max(0) as usize;
         let hits = &hits[..hits.len().min(limit)];
