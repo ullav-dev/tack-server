@@ -1,7 +1,9 @@
 pub mod note_folders;
+pub mod note_reads;
 pub mod notes;
 pub mod pages;
 pub mod spaces;
+pub mod system_principals;
 
 use anyhow::{Context, Result};
 use deadpool_postgres::{Config as PgConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};

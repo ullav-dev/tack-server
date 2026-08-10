@@ -62,10 +62,15 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::notes::list_revisions,
         handlers::notes::create_revision,
         handlers::notes::delete_revision,
+        handlers::notes::mark_note_read,
+        handlers::notes::list_unread,
         handlers::note_folders::create_note_folder,
         handlers::note_folders::list_note_folders,
         handlers::note_folders::update_note_folder,
         handlers::note_folders::delete_note_folder,
+        handlers::system_principals::create_system_principal,
+        handlers::system_principals::list_system_principals,
+        handlers::system_principals::delete_system_principal,
         handlers::search::search,
         handlers::spaces::create_space,
         handlers::spaces::list_spaces,
@@ -98,12 +103,17 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::note::ReplyRequest,
         models::note::UpdateNoteRequest,
         models::note::NoteRevision,
+        models::note::NoteRead,
+        models::note::NoteUnreadStatus,
         models::note::NotesPage,
         models::note::NoteAttachment,
         models::note::NoteFolder,
         models::note::NoteFoldersPage,
         models::note::CreateNoteFolderRequest,
         models::note::UpdateNoteFolderRequest,
+        models::system_principal::SystemPrincipal,
+        models::system_principal::CreateSystemPrincipalRequest,
+        models::system_principal::SystemPrincipalsPage,
         search::SearchHit,
         search::SearchTypeResults,
         search::SearchResults,
@@ -215,6 +225,7 @@ async fn main() -> Result<()> {
         host_from_uri(&cfg.tack_mcp_canonical_uri),
     );
 
+    let user_management_base_url = cfg.oauth2_issuer.clone();
     let state = AppState {
         db: pool,
         // Empty audience — this validates general API bearer tokens (any UUM-issued
@@ -227,6 +238,8 @@ async fn main() -> Result<()> {
         ),
         search: search_client,
         embedder,
+        user_management_http: reqwest::Client::new(),
+        user_management_base_url,
     };
 
     let app = Router::new()
@@ -255,6 +268,8 @@ async fn main() -> Result<()> {
             get(handlers::notes::list_revisions).post(handlers::notes::create_revision),
         )
         .route("/notes/:id/revisions/:revision_id", axum::routing::delete(handlers::notes::delete_revision))
+        .route("/notes/:id/read", post(handlers::notes::mark_note_read))
+        .route("/notes/unread", get(handlers::notes::list_unread))
         .route(
             "/note-folders",
             post(handlers::note_folders::create_note_folder).get(handlers::note_folders::list_note_folders),
@@ -264,6 +279,11 @@ async fn main() -> Result<()> {
             axum::routing::patch(handlers::note_folders::update_note_folder)
                 .delete(handlers::note_folders::delete_note_folder),
         )
+        .route(
+            "/system-principals",
+            post(handlers::system_principals::create_system_principal).get(handlers::system_principals::list_system_principals),
+        )
+        .route("/system-principals/:id", axum::routing::delete(handlers::system_principals::delete_system_principal))
         .route("/search", get(handlers::search::search))
         .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
         .route("/spaces/:id", axum::routing::patch(handlers::spaces::update_space))

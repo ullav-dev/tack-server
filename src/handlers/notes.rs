@@ -5,15 +5,16 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::TackUser;
+use crate::auth::{RawBearerToken, TackUser};
 use crate::db;
 use crate::db::notes::FolderScope;
 use crate::error::{AppError, AppResult};
 use crate::handlers::note_folders::check_folder_in_team;
 use crate::models::note::{
-    AttachRequest, CreateNoteRequest, Note, NoteAttachment, NoteRevision, NotesPage, ReplyRequest, UpdateNoteRequest,
+    AttachRequest, CreateNoteRequest, Note, NoteAttachment, NoteRead, NoteRevision, NoteUnreadStatus, NotesPage, ReplyRequest,
+    UpdateNoteRequest,
 };
-use crate::notes_acl::{can_edit, resolve_team_organization, resolve_visible_note};
+use crate::notes_acl::{can_edit, resolve_team_organization, resolve_team_organization_live, resolve_visible_note};
 use crate::AppState;
 
 #[utoipa::path(
@@ -26,6 +27,7 @@ use crate::AppState;
 pub async fn create_note(
     State(state): State<AppState>,
     user: TackUser,
+    RawBearerToken(raw_token): RawBearerToken,
     Json(body): Json<CreateNoteRequest>,
 ) -> AppResult<Json<Note>> {
     if body.title.trim().is_empty() {
@@ -34,7 +36,12 @@ pub async fn create_note(
     if body.body_markdown.trim().is_empty() {
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
-    let organization_id = resolve_team_organization(&user, body.team_id)?;
+    // Live-resolution fallback only actually does anything (a network call)
+    // for an admin caller on a team outside their own JWT claims -- see
+    // `resolve_team_organization_live`'s doc comment. Every other caller
+    // takes the exact same fast JWT-only path `resolve_team_organization`
+    // always did.
+    let organization_id = resolve_team_organization_live(&state, &user, &raw_token, body.team_id).await?;
     if let Some(folder_id) = body.folder_id {
         check_folder_in_team(&state, organization_id, body.team_id, folder_id, user.user_id).await?;
     }
@@ -419,5 +426,76 @@ pub async fn delete_revision(
     }
     db::notes::delete_revision(&state.db, &note, revision_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Marks a top-level note read by the caller, as of now — see
+/// `010_note_reads.sql`. Any caller who can view the note may mark it read;
+/// this isn't a `can_edit`-gated action, it's purely the caller's own
+/// read state.
+#[utoipa::path(
+    post,
+    path = "/notes/{id}/read",
+    responses((status = 200, description = "Read marker updated", body = NoteRead)),
+    tag = "notes"
+)]
+pub async fn mark_note_read(State(state): State<AppState>, user: TackUser, Path(id): Path<Uuid>) -> AppResult<Json<NoteRead>> {
+    let note = resolve_visible_note(&state.db, &user, id).await?;
+    let read = db::note_reads::mark_read(&state.db, note.id, note.organization_id, user.user_id).await?;
+    Ok(Json(read))
+}
+
+const MAX_UNREAD_IDS: usize = 200;
+
+#[derive(Debug, Deserialize)]
+pub struct UnreadQuery {
+    /// Comma-separated note ids to check, capped at 200 per call.
+    pub ids: String,
+}
+
+/// Live unread status for a batch of top-level notes — see
+/// `db::note_reads::unread_status`'s doc comment for exactly what "unread"
+/// means. Notes the caller can't view (or that don't exist) are silently
+/// omitted from the response rather than erroring the whole batch — same
+/// posture as `note_id` being invalid on a route the caller has no access
+/// to elsewhere in this API: no information disclosure either way, and one
+/// bad id in a UI-driven badge-refresh batch shouldn't fail the rest.
+#[utoipa::path(
+    get,
+    path = "/notes/unread",
+    params(("ids" = String, Query, description = "Comma-separated note ids, max 200")),
+    responses((status = 200, description = "Unread status for each requested note the caller can view", body = Vec<NoteUnreadStatus>)),
+    tag = "notes"
+)]
+pub async fn list_unread(
+    State(state): State<AppState>,
+    user: TackUser,
+    Query(query): Query<UnreadQuery>,
+) -> AppResult<Json<Vec<NoteUnreadStatus>>> {
+    let requested: Vec<Uuid> = query
+        .ids
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<Uuid>().map_err(|_| AppError::BadRequest(format!("Invalid note id: {s}"))))
+        .collect::<AppResult<Vec<_>>>()?;
+    if requested.len() > MAX_UNREAD_IDS {
+        return Err(AppError::BadRequest(format!("Too many ids: max {MAX_UNREAD_IDS} per call.")));
+    }
+
+    // Visible notes are resolved (and grouped by organization) first, then
+    // batched one query per organization — a caller's requested ids are
+    // almost always all in one org in practice, but nothing here assumes it.
+    let mut by_org: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+    for id in requested {
+        if let Ok(note) = resolve_visible_note(&state.db, &user, id).await {
+            by_org.entry(note.organization_id).or_default().push(note.id);
+        }
+    }
+
+    let mut statuses = Vec::new();
+    for (org_id, ids) in by_org {
+        statuses.extend(db::note_reads::unread_status(&state.db, &ids, org_id, user.user_id).await?);
+    }
+    Ok(Json(statuses))
 }
 
