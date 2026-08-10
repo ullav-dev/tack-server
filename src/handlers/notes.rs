@@ -87,7 +87,12 @@ pub struct ListNotesByAttachmentQuery {
 /// and returns the first match — an entity's notes only ever belong to one
 /// organization in practice (an attachment is created once, by whichever
 /// team's note it is), so this isn't a fan-out concern, just a scan over a
-/// typically-small list.
+/// typically-small list. The DB query itself is visibility-blind (it only
+/// scopes by organization_id, same as `get_note`), so every row is run
+/// through `notes_acl::can_view` before being returned — otherwise another
+/// team's `private` or `team`-visibility note attached to the same entity
+/// would leak to any member of the organization, unlike `GET /notes` which
+/// already excludes other people's private notes at the SQL level.
 #[utoipa::path(
     get,
     path = "/notes/by-entity",
@@ -114,7 +119,8 @@ pub async fn list_notes_by_attachment(
         )
         .await?;
         if !notes.is_empty() {
-            return Ok(Json(notes));
+            let visible: Vec<_> = notes.into_iter().filter(|n| crate::notes_acl::can_view(n, &user)).collect();
+            return Ok(Json(visible));
         }
     }
     Ok(Json(Vec::new()))
