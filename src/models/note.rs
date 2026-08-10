@@ -233,6 +233,27 @@ pub struct NoteFoldersPage {
     pub total: i64,
 }
 
+/// The caller's read marker for a top-level note, returned after
+/// `POST /notes/{id}/read` -- see `010_note_reads.sql`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NoteRead {
+    pub note_id: Uuid,
+    pub read_at: DateTime<Utc>,
+}
+
+/// Live-computed unread status for one top-level note, as seen by the
+/// caller -- never denormalized onto the note itself (see
+/// `010_note_reads.sql`'s header). `unread` is `true` if the caller has
+/// never marked this thread read, or has read it before `last_activity_at`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NoteUnreadStatus {
+    pub note_id: Uuid,
+    pub unread: bool,
+    /// The note's own `updated_at`, or its most recent reply's, whichever
+    /// is later.
+    pub last_activity_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

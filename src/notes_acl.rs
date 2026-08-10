@@ -67,6 +67,83 @@ pub fn resolve_team_organization(user: &TackUser, team_id: Uuid) -> AppResult<Uu
     })
 }
 
+/// `resolve_team_organization`, extended with an admin-only fallback for a
+/// team the caller isn't a JWT-claimed member of.
+///
+/// `TackUser.teams` is built entirely from the caller's own JWT `teams`
+/// claim (`auth::build_tack_user`), which ullav-user-management scopes to
+/// actual membership — never "every team" just because the caller is an
+/// admin (the JWT claim is a per-user snapshot, not a role check). That's
+/// the right rule for a normal caller creating their own content, but it
+/// leaves admins with no way to create/backfill content under a team they
+/// don't personally belong to -- e.g. a one-off migration script moving
+/// content in from another system team-by-team.
+///
+/// For an admin caller on a team outside their own JWT claims, this
+/// resolves the organization live against ullav-user-management's
+/// `GET /admin/teams/{id}` (`users:read`-gated there) instead -- arguably
+/// more correct even for teams the admin *is* a member of, since the JWT
+/// claim is a snapshot from login time and the live endpoint isn't, but the
+/// fast, no-network JWT path stays the default for that case rather than
+/// paying a live HTTP round-trip on every note creation.
+///
+/// Forwards the caller's own token to ullav-user-management (`raw_token`) --
+/// same "no separate service credential, just the interactive JWT" pattern
+/// used throughout this org (see lagan-server's retired proxy). A 403/404
+/// from that call means this admin's own token doesn't actually carry
+/// `users:read`, or the team doesn't exist -- surfaced here as the same
+/// error shape a normal caller would get, not a 500.
+pub async fn resolve_team_organization_live(
+    state: &crate::AppState,
+    user: &TackUser,
+    raw_token: &str,
+    team_id: Uuid,
+) -> AppResult<Uuid> {
+    if let Some(membership) = user.teams.get(&team_id) {
+        return membership.organization_id.ok_or_else(|| {
+            AppError::BadRequest(
+                "This team has no organization assigned yet — ask an admin to assign one before creating Tack content here.".into(),
+            )
+        });
+    }
+    if !user.is_admin {
+        return Err(AppError::Forbidden("You are not a member of this team.".into()));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TeamLookup {
+        organization_id: Option<Uuid>,
+    }
+
+    let resp = state
+        .user_management_http
+        .get(format!("{}/admin/teams/{team_id}", state.user_management_base_url))
+        .bearer_auth(raw_token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("ullav-user-management call failed: {e}")))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::BadRequest("team_id does not refer to an existing team.".into()));
+    }
+    if !resp.status().is_success() {
+        return Err(AppError::Forbidden(
+            "Could not resolve this team's organization (your account may lack ullav-user-management's users:read permission).".into(),
+        ));
+    }
+
+    let team: TeamLookup = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("malformed ullav-user-management response: {e}")))?;
+
+    team.organization_id.ok_or_else(|| {
+        AppError::BadRequest(
+            "This team has no organization assigned yet — ask an admin to assign one before creating Tack content here.".into(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +252,124 @@ mod tests {
         teams.insert(team_id, TackTeamMembership { role: "member".into(), organization_id: Some(n.organization_id) });
         let other_member = user(false, teams);
         assert!(!can_edit(&n, &other_member), "a team member who isn't the creator must not be able to edit");
+    }
+
+    // ── resolve_team_organization_live ──────────────────────────────────────
+
+    /// A minimal `AppState` for these tests -- `db::create_pool` only builds
+    /// a deadpool config (no connection attempt until first use), and
+    /// neither `SearchClient::new` nor `TokenValidator::new` do any I/O
+    /// either, so this never touches Postgres/OpenSearch/JWKS -- only
+    /// `user_management_http`/`user_management_base_url` are exercised by
+    /// the tests below.
+    fn app_state(user_management_base_url: &str) -> crate::AppState {
+        crate::AppState {
+            db: db::create_pool("postgresql://test:test@localhost/test").expect("pool config"),
+            api_validator: ullav_mcp_auth::TokenValidator::new("http://localhost/jwks", "http://localhost", ""),
+            search: crate::search::SearchClient::new("http://localhost:9200"),
+            embedder: None,
+            user_management_http: reqwest::Client::new(),
+            user_management_base_url: user_management_base_url.to_string(),
+        }
+    }
+
+    /// Spawns a one-shot raw-TCP HTTP server: accepts exactly one
+    /// connection, asserts the request carries `Authorization: Bearer
+    /// <expected_token>`, and replies with `status`/`body`. No mocking
+    /// crate needed -- this exercises the real `reqwest` call end to end
+    /// against a real socket, not a stubbed client. Returns the bound
+    /// `http://127.0.0.1:<port>` base URL.
+    async fn spawn_mock_user_management(status: u16, body: String, expected_token: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                request.to_lowercase().contains(&format!("authorization: bearer {}", expected_token.to_lowercase())),
+                "expected the caller's own token to be forwarded, got:\n{request}"
+            );
+            let reason = match status {
+                200 => "OK",
+                403 => "Forbidden",
+                404 => "Not Found",
+                _ => "Error",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write response");
+            socket.shutdown().await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn jwt_member_path_never_makes_a_network_call() {
+        let org = Uuid::new_v4();
+        let team_id = Uuid::new_v4();
+        let mut teams = HashMap::new();
+        teams.insert(team_id, TackTeamMembership { role: "member".into(), organization_id: Some(org) });
+        let u = user(false, teams);
+        // An unreachable base URL proves this path never dials out -- if it
+        // did, this would hang/error instead of returning immediately.
+        let state = app_state("http://127.0.0.1:1");
+        let result = resolve_team_organization_live(&state, &u, "unused-token", team_id).await;
+        assert_eq!(result.unwrap(), org);
+    }
+
+    #[tokio::test]
+    async fn non_admin_outside_the_team_is_forbidden_without_a_network_call() {
+        let u = user(false, HashMap::new());
+        let state = app_state("http://127.0.0.1:1");
+        let result = resolve_team_organization_live(&state, &u, "unused-token", Uuid::new_v4()).await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn admin_outside_the_team_resolves_live_and_forwards_the_callers_token() {
+        let org = Uuid::new_v4();
+        let base = spawn_mock_user_management(200, format!("{{\"organization_id\":\"{org}\"}}"), "the-callers-token").await;
+        let leaked_base: &'static str = Box::leak(base.into_boxed_str());
+        let u = user(true, HashMap::new());
+        let state = app_state(leaked_base);
+        let result = resolve_team_organization_live(&state, &u, "the-callers-token", Uuid::new_v4()).await;
+        assert_eq!(result.unwrap(), org);
+    }
+
+    #[tokio::test]
+    async fn admin_live_lookup_with_no_organization_assigned_is_a_bad_request() {
+        let base = spawn_mock_user_management(200, "{\"organization_id\":null}".to_string(), "tok").await;
+        let leaked_base: &'static str = Box::leak(base.into_boxed_str());
+        let u = user(true, HashMap::new());
+        let state = app_state(leaked_base);
+        let result = resolve_team_organization_live(&state, &u, "tok", Uuid::new_v4()).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn admin_live_lookup_404_is_a_bad_request_not_a_500() {
+        let base = spawn_mock_user_management(404, "{\"error\":\"not found\"}".to_string(), "tok").await;
+        let leaked_base: &'static str = Box::leak(base.into_boxed_str());
+        let u = user(true, HashMap::new());
+        let state = app_state(leaked_base);
+        let result = resolve_team_organization_live(&state, &u, "tok", Uuid::new_v4()).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn admin_live_lookup_403_surfaces_as_forbidden_not_a_500() {
+        // The realistic case: the admin's own token lacks
+        // ullav-user-management's `users:read` permission.
+        let base = spawn_mock_user_management(403, "{\"error\":\"forbidden\"}".to_string(), "tok").await;
+        let leaked_base: &'static str = Box::leak(base.into_boxed_str());
+        let u = user(true, HashMap::new());
+        let state = app_state(leaked_base);
+        let result = resolve_team_organization_live(&state, &u, "tok", Uuid::new_v4()).await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
     }
 }
