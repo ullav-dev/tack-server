@@ -19,4 +19,13 @@ pub struct AppState {
     /// search degrades to lexical-only rather than the whole server
     /// refusing to start, same resilience posture as OpenSearch being down.
     pub embedder: Option<embeddings::Embedder>,
+    /// Shared client for the occasional service-to-service call back to
+    /// ullav-user-management (currently just `notes_acl::resolve_team_organization_live`'s
+    /// admin cross-team lookup) — one shared connection pool rather than a
+    /// fresh `reqwest::Client` per call.
+    pub user_management_http: reqwest::Client,
+    /// Same value as `api_validator`'s issuer (`OAUTH2_ISSUER`) — kept as
+    /// its own field since `Config` is consumed building `api_validator`
+    /// before `AppState` is built.
+    pub user_management_base_url: String,
 }

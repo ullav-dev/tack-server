@@ -151,6 +151,37 @@ where
     }
 }
 
+/// The caller's raw bearer token, unvalidated by this extractor itself (a
+/// handler that wants this alongside `TackUser` gets both -- `TackUser`'s
+/// own extraction already validates it). Exists solely to forward the
+/// caller's own token to another service call the caller is implicitly
+/// authorizing by making this request -- currently just
+/// `notes_acl::resolve_team_organization_live`'s admin cross-team lookup
+/// against ullav-user-management, same "forward the interactive JWT
+/// as-is, no separate service credential" pattern lagan-server used for its
+/// (now-retired) tack-server proxy.
+pub struct RawBearerToken(pub String);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for RawBearerToken
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let auth_header = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| AppError::Unauthorized("Missing Authorization header".into()))?;
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| AppError::Unauthorized("Authorization must use Bearer scheme".into()))?;
+        Ok(RawBearerToken(token.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

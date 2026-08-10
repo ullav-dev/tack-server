@@ -5,11 +5,11 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::TackUser;
+use crate::auth::{RawBearerToken, TackUser};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::note::{CreateNoteFolderRequest, NoteFolder, NoteFoldersPage, UpdateNoteFolderRequest};
-use crate::notes_acl::resolve_team_organization;
+use crate::notes_acl::resolve_team_organization_live;
 use crate::AppState;
 
 /// Resolves a bare folder id to a `NoteFolder`, scoped to whichever of the
@@ -68,13 +68,14 @@ pub async fn check_folder_in_team(
 pub async fn create_note_folder(
     State(state): State<AppState>,
     user: TackUser,
+    RawBearerToken(raw_token): RawBearerToken,
     Json(body): Json<CreateNoteFolderRequest>,
 ) -> AppResult<Json<NoteFolder>> {
     let name = body.name.trim();
     if name.is_empty() {
         return Err(AppError::BadRequest("name must not be empty".into()));
     }
-    let organization_id = resolve_team_organization(&user, body.team_id)?;
+    let organization_id = resolve_team_organization_live(&state, &user, &raw_token, body.team_id).await?;
     let folder = db::note_folders::create_folder(&state.db, organization_id, body.team_id, name, user.user_id).await?;
     Ok(Json(folder))
 }
