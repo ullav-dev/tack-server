@@ -66,6 +66,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::notes::list_unread,
         handlers::note_folders::create_note_folder,
         handlers::note_folders::list_note_folders,
+        handlers::note_folders::list_note_folders_by_attachment,
         handlers::note_folders::update_note_folder,
         handlers::note_folders::delete_note_folder,
         handlers::system_principals::create_system_principal,
@@ -274,6 +275,7 @@ async fn main() -> Result<()> {
             "/note-folders",
             post(handlers::note_folders::create_note_folder).get(handlers::note_folders::list_note_folders),
         )
+        .route("/note-folders/by-entity", get(handlers::note_folders::list_note_folders_by_attachment))
         .route(
             "/note-folders/:id",
             axum::routing::patch(handlers::note_folders::update_note_folder)

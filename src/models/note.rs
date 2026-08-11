@@ -199,12 +199,24 @@ pub struct NoteRevision {
 /// delete a folder (this is an organizational tool, not access-controlled
 /// content — a folder itself carries no visibility of its own; each note's
 /// own `Visibility` still governs who can see it inside the folder).
+///
+/// `owning_service`/`entity_type`/`entity_id` (see `012_entity_scoped_note_
+/// folders.sql`) optionally scope a folder to one specific attached entity
+/// instead of the whole team -- e.g. a cunav ticket's own sub-folders. All
+/// three are `None` together (a team-wide folder, listed in `GET
+/// /note-folders` and tack's own Navigator) or all three are `Some`
+/// together (an entity-scoped folder, listed only via `GET /note-folders/
+/// by-entity` and excluded from team-wide listing) -- same all-or-nothing
+/// invariant `AttachRequest` already uses for notes themselves.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NoteFolder {
     pub id: Uuid,
     pub organization_id: Uuid,
     pub team_id: Uuid,
     pub name: String,
+    pub owning_service: Option<String>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Count of top-level notes currently filed here — denormalized at read
@@ -219,6 +231,10 @@ pub struct NoteFolder {
 pub struct CreateNoteFolderRequest {
     pub team_id: Uuid,
     pub name: String,
+    /// Optionally scopes the new folder to one attached entity instead of
+    /// leaving it team-wide -- see `NoteFolder`'s doc comment.
+    #[serde(default)]
+    pub attach: Option<AttachRequest>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

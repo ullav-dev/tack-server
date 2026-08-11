@@ -43,7 +43,12 @@ pub async fn create_note(
     // always did.
     let organization_id = resolve_team_organization_live(&state, &user, &raw_token, body.team_id).await?;
     if let Some(folder_id) = body.folder_id {
-        check_folder_in_team(&state, organization_id, body.team_id, folder_id, user.user_id).await?;
+        let attachments: Vec<(&str, &str, &str)> = body
+            .attach
+            .as_ref()
+            .map(|a| vec![(a.owning_service.as_str(), a.entity_type.as_str(), a.entity_id.as_str())])
+            .unwrap_or_default();
+        check_folder_in_team(&state, organization_id, body.team_id, folder_id, user.user_id, &attachments).await?;
     }
     // Backfill-only: only an admin caller's created_at/created_by overrides
     // are honored, so an ordinary API consumer can never backdate a note or
@@ -235,7 +240,10 @@ pub async fn update_note(
             let team_id = note
                 .team_id
                 .ok_or_else(|| AppError::BadRequest("This note has no team, so it can't be filed into a folder.".into()))?;
-            check_folder_in_team(&state, note.organization_id, team_id, folder_id, user.user_id).await?;
+            let existing = db::notes::list_note_attachments(&state.db, note.organization_id, note.id).await?;
+            let attachments: Vec<(&str, &str, &str)> =
+                existing.iter().map(|a| (a.owning_service.as_str(), a.entity_type.as_str(), a.entity_id.as_str())).collect();
+            check_folder_in_team(&state, note.organization_id, team_id, folder_id, user.user_id, &attachments).await?;
         }
     }
     let updated = db::notes::update_note(
