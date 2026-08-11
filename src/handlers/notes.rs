@@ -50,11 +50,29 @@ pub async fn create_note(
             .unwrap_or_default();
         check_folder_in_team(&state, organization_id, body.team_id, folder_id, user.user_id, &attachments).await?;
     }
-    // Backfill-only: only an admin caller's created_at/created_by overrides
-    // are honored, so an ordinary API consumer can never backdate a note or
-    // attribute it to someone else.
+    // Backfill-only: only an admin caller's created_at override is honored,
+    // so an ordinary API consumer can never backdate a note.
     let created_at = if user.is_admin { body.created_at } else { None };
-    let created_by = if user.is_admin { body.created_by.unwrap_or(user.user_id) } else { user.user_id };
+    // created_by: an admin may attribute a note to anyone (backfill). A
+    // non-admin caller (e.g. a service account driving AI triage or
+    // inbound-email ingestion, neither of which should need full admin just
+    // to post as a bot) may attribute a note to an *existing system
+    // principal in this same organization* -- verified by a real DB lookup,
+    // not trusted from the request body, so this can never be used to
+    // impersonate an arbitrary human's UUID. Any other claimed created_by
+    // from a non-admin is silently ignored (falls back to the caller's own
+    // id), matching this endpoint's behavior before system principals
+    // existed at all.
+    let created_by = if user.is_admin {
+        body.created_by.unwrap_or(user.user_id)
+    } else if let Some(claimed) = body.created_by {
+        match db::system_principals::get_principal(&state.db, claimed, organization_id).await? {
+            Some(_) => claimed,
+            None => user.user_id,
+        }
+    } else {
+        user.user_id
+    };
     let note = db::notes::create_note(
         &state.db,
         db::notes::NewNote {
