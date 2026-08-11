@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -151,13 +151,18 @@ pub struct NewSticky {
 /// `handlers::idea_boards`' doc comment on why sticky ACL is
 /// board-team-membership, not `notes_acl`) plus its `idea_board_stickies`
 /// layout row, in one transaction.
-pub async fn create_sticky(pool: &Pool, board: &IdeaBoard, new: NewSticky, created_by: Uuid) -> Result<Sticky, AppError> {
+pub async fn create_sticky(
+    pool: &Pool,
+    board: &IdeaBoard,
+    new: NewSticky,
+    created_by: Uuid,
+    created_at: DateTime<Utc>,
+) -> Result<Sticky, AppError> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
 
     let note_id = Uuid::new_v4();
     let thread_path = ltree_label(note_id);
-    let created_at = Utc::now();
 
     tx.execute(
         "INSERT INTO notes (id, organization_id, team_id, thread_path, visibility, title, created_by, folder_id, created_at, updated_at)
@@ -399,7 +404,13 @@ const DEFAULT_SHAPE_STROKE_WIDTH: f64 = 2.0;
 const DEFAULT_SHAPE_LABEL_COLOR: &str = "#1e293b";
 const DEFAULT_SHAPE_LABEL_SIZE: i32 = 13;
 
-pub async fn create_shape(pool: &Pool, board: &IdeaBoard, new: NewShape, created_by: Uuid) -> Result<BoardShape, AppError> {
+pub async fn create_shape(
+    pool: &Pool,
+    board: &IdeaBoard,
+    new: NewShape,
+    created_by: Uuid,
+    created_at: DateTime<Utc>,
+) -> Result<BoardShape, AppError> {
     let client = pool.get().await?;
     let width = new.width.unwrap_or(DEFAULT_SHAPE_WIDTH);
     let height = new.height.unwrap_or(DEFAULT_SHAPE_HEIGHT);
@@ -413,8 +424,8 @@ pub async fn create_shape(pool: &Pool, board: &IdeaBoard, new: NewShape, created
             "INSERT INTO board_shapes
                 (organization_id, board_id, shape_type, x, y,
                  width, height, fill_color, stroke_color, stroke_width,
-                 label, label_color, label_size, image_url, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                 label, label_color, label_size, image_url, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
              RETURNING id",
             &[
                 &board.organization_id,
@@ -432,6 +443,7 @@ pub async fn create_shape(pool: &Pool, board: &IdeaBoard, new: NewShape, created
                 &label_size,
                 &new.image_url,
                 &created_by,
+                &created_at,
             ],
         )
         .await?;
@@ -576,13 +588,19 @@ pub struct NewLink {
 /// Catches the `note_links_from_note_id_to_note_id_organization_id_key`
 /// unique-constraint violation (Postgres SQLSTATE 23505) to return a clear
 /// 400 instead of a raw DB error -- mirrors awe-server's own `create_link`.
-pub async fn create_link(pool: &Pool, board: &IdeaBoard, new: NewLink, created_by: Uuid) -> Result<NoteLink, AppError> {
+pub async fn create_link(
+    pool: &Pool,
+    board: &IdeaBoard,
+    new: NewLink,
+    created_by: Uuid,
+    created_at: DateTime<Utc>,
+) -> Result<NoteLink, AppError> {
     let client = pool.get().await?;
     let result = client
         .query_one(
             "INSERT INTO note_links
-                (organization_id, board_id, from_note_id, to_note_id, from_shape_id, to_shape_id, from_port, to_port, label, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (organization_id, board_id, from_note_id, to_note_id, from_shape_id, to_shape_id, from_port, to_port, label, created_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              RETURNING id",
             &[
                 &board.organization_id,
@@ -595,6 +613,7 @@ pub async fn create_link(pool: &Pool, board: &IdeaBoard, new: NewLink, created_b
                 &new.to_port,
                 &new.label,
                 &created_by,
+                &created_at,
             ],
         )
         .await;

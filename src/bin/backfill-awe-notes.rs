@@ -189,10 +189,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Excludes any note filed into an `ideas_board` folder (a sticky's
+    // underlying note) even though its own `entity_type` matches the filter
+    // above -- `create_sticky` copies the board's entity scope onto every
+    // sticky note, so without this join a sticky would otherwise match this
+    // query too. `awe_folders` above only loaded `folder_type = 'general'`
+    // rows, so a sticky's `folder_id` would find no entry in
+    // `folder_id_map` below and land in tack-server unfiled -- a real bug
+    // caught in review before this script ever ran against real data (see
+    // git history). Stickies get their own note (with idea_board_stickies
+    // layout) via `backfill-awe-idea-boards`, not this script.
     let mut all_notes = Vec::new();
     for row in awe.query(
-        "SELECT id, entity_type, entity_id, title, body, is_shared, parent_id, folder_id, created_by, created_at
-         FROM notes WHERE entity_type IN ('task', 'workflow', 'job', 'project') ORDER BY created_at",
+        "SELECT n.id, n.entity_type, n.entity_id, n.title, n.body, n.is_shared, n.parent_id, n.folder_id, n.created_by, n.created_at
+         FROM notes n
+         LEFT JOIN note_folders f ON f.id = n.folder_id
+         WHERE n.entity_type IN ('task', 'workflow', 'job', 'project')
+           AND (f.id IS NULL OR f.folder_type != 'ideas_board')
+         ORDER BY n.created_at",
         &[],
     )
     .await?

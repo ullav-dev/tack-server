@@ -91,6 +91,16 @@ pub struct CreateStickyRequest {
     pub linked_entity_type: Option<String>,
     #[serde(default)]
     pub linked_entity_id: Option<String>,
+    /// Backfill-only: same admin-only (or existing-system-principal)
+    /// timestamp/author override as `CreateNoteRequest::created_at`/
+    /// `created_by` -- lets `backfill-awe-idea-boards` preserve a sticky's
+    /// original author and creation time instead of attributing every
+    /// backfilled sticky to whichever admin ran the migration. Silently
+    /// ignored for an ordinary caller. See `handlers::idea_boards::create_sticky`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub created_by: Option<Uuid>,
 }
 
 /// All fields optional -- omitted means "leave unchanged." Unlike
@@ -166,6 +176,12 @@ pub struct CreateBoardShapeRequest {
     pub label_size: Option<f64>,
     #[serde(default)]
     pub image_url: Option<String>,
+    /// Backfill-only override, same admin-or-system-principal rule as
+    /// `CreateStickyRequest::created_at`/`created_by`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub created_by: Option<Uuid>,
 }
 
 /// `label`/`image_url` are tri-state (omit = leave unchanged, `null` =
@@ -237,6 +253,12 @@ pub struct CreateNoteLinkRequest {
     pub to_port: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Backfill-only override, same as `CreateBoardShapeRequest::created_at`/
+    /// `created_by`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub created_by: Option<Uuid>,
 }
 
 /// All three fields tri-state (omit = leave unchanged, `null` = clear, a
