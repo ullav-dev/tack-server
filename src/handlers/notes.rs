@@ -84,10 +84,20 @@ pub struct ListNotesByAttachmentQuery {
 /// `db::notes::list_notes_by_attachment`. Scoped to the caller's own
 /// organizations: since `content_attachments` carries no visibility of its
 /// own, this walks every one of the caller's Tack-enabled-team organizations
-/// and returns the first match — an entity's notes only ever belong to one
-/// organization in practice (an attachment is created once, by whichever
-/// team's note it is), so this isn't a fan-out concern, just a scan over a
-/// typically-small list.
+/// and returns the first org with any *visible* rows — an entity's notes
+/// only ever belong to one organization in practice (an attachment is
+/// created once, by whichever team's note it is), so this isn't a fan-out
+/// concern, just a scan over a typically-small list. The DB query itself is
+/// visibility-blind (it only scopes by organization_id, same as `get_note`),
+/// so every row is run through `notes_acl::can_view` before being counted —
+/// otherwise another team's `private` or `team`-visibility note attached to
+/// the same entity would leak to any member of the organization, unlike
+/// `GET /notes` which already excludes other people's private notes at the
+/// SQL level. Critically, the visibility filter runs *before* the
+/// early-return check: an org whose only attached rows are all invisible to
+/// this caller must not stop the scan, or a caller in two orgs would get an
+/// empty result instead of falling through to the org that actually holds a
+/// note they can see.
 #[utoipa::path(
     get,
     path = "/notes/by-entity",
@@ -113,8 +123,9 @@ pub async fn list_notes_by_attachment(
             &query.entity_id,
         )
         .await?;
-        if !notes.is_empty() {
-            return Ok(Json(notes));
+        let visible: Vec<_> = notes.into_iter().filter(|n| crate::notes_acl::can_view(n, &user)).collect();
+        if !visible.is_empty() {
+            return Ok(Json(visible));
         }
     }
     Ok(Json(Vec::new()))
