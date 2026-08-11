@@ -9,7 +9,7 @@ use crate::models::note::{Note, NoteRevision, Visibility};
 
 /// UUID encoded as a 32-char lowercase hex string with no hyphens — the only
 /// UUID form that's a valid ltree label (labels are `[A-Za-z0-9_]+` only).
-fn ltree_label(id: Uuid) -> String {
+pub(crate) fn ltree_label(id: Uuid) -> String {
     id.simple().to_string()
 }
 
@@ -291,7 +291,9 @@ pub async fn create_reply(
     })
 }
 
-async fn insert_body_and_first_revision(
+// `pub(crate)` -- `db::idea_boards::create_sticky` reuses this to create a
+// sticky's underlying note in the same transaction as its layout row.
+pub(crate) async fn insert_body_and_first_revision(
     tx: &deadpool_postgres::Transaction<'_>,
     note_id: Uuid,
     organization_id: Uuid,
@@ -313,7 +315,7 @@ async fn insert_body_and_first_revision(
     Ok(())
 }
 
-async fn enqueue_outbox_event(
+pub(crate) async fn enqueue_outbox_event(
     tx: &deadpool_postgres::Transaction<'_>,
     organization_id: Uuid,
     content_id: Uuid,

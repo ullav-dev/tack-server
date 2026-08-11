@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::auth::{RawBearerToken, TackUser};
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::note::{CreateNoteFolderRequest, NoteFolder, NoteFoldersPage, UpdateNoteFolderRequest};
+use crate::models::note::{CreateNoteFolderRequest, FolderType, NoteFolder, NoteFoldersPage, UpdateNoteFolderRequest};
 use crate::notes_acl::resolve_team_organization_live;
 use crate::AppState;
 
@@ -66,6 +66,16 @@ pub async fn check_folder_in_team(
     if folder.team_id != team_id {
         return Err(AppError::BadRequest("folder_id must belong to the note's own team.".into()));
     }
+    // An Idea Board is a note_folders row too, but its notes are stickies,
+    // managed exclusively through handlers::idea_boards (which never calls
+    // this function) -- filing an ordinary note into a board via
+    // POST/PATCH /notes would create a note with no idea_board_stickies
+    // row, and would also break delete_board's "delete every sticky's note,
+    // then the folder" ordering (the leftover note keeps the folder's own
+    // notes_folder_id_fkey from being satisfied on delete).
+    if folder.folder_type != "general" {
+        return Err(AppError::BadRequest("folder_id refers to an Idea Board, not a Notes folder.".into()));
+    }
     if let (Some(folder_owning_service), Some(folder_entity_type), Some(folder_entity_id)) =
         (&folder.owning_service, &folder.entity_type, &folder.entity_id)
     {
@@ -99,9 +109,16 @@ pub async fn create_note_folder(
         return Err(AppError::BadRequest("name must not be empty".into()));
     }
     let organization_id = resolve_team_organization_live(&state, &user, &raw_token, body.team_id).await?;
-    let folder =
-        db::note_folders::create_folder(&state.db, organization_id, body.team_id, name, user.user_id, body.attach.as_ref())
-            .await?;
+    let folder = db::note_folders::create_folder(
+        &state.db,
+        organization_id,
+        body.team_id,
+        name,
+        user.user_id,
+        body.attach.as_ref(),
+        FolderType::General,
+    )
+    .await?;
     Ok(Json(folder))
 }
 
@@ -147,6 +164,7 @@ pub async fn list_note_folders_by_attachment(
             &query.entity_type,
             &query.entity_id,
             user.user_id,
+            "general",
         )
         .await?;
         let visible: Vec<_> = folders.into_iter().filter(|f| user.is_admin || user.teams.contains_key(&f.team_id)).collect();
@@ -203,7 +221,8 @@ pub async fn list_note_folders(
     let mut total = 0;
     for org_id in user.organization_ids() {
         let (org_folders, org_total) =
-            db::note_folders::list_folders_for_teams(&state.db, org_id, &team_ids, user.user_id, limit, offset).await?;
+            db::note_folders::list_folders_for_teams(&state.db, org_id, &team_ids, user.user_id, limit, offset, "general")
+                .await?;
         folders.extend(org_folders);
         total += org_total;
     }

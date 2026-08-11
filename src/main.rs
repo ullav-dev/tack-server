@@ -72,6 +72,25 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::system_principals::create_system_principal,
         handlers::system_principals::list_system_principals,
         handlers::system_principals::delete_system_principal,
+        handlers::idea_boards::create_board,
+        handlers::idea_boards::list_boards,
+        handlers::idea_boards::list_boards_by_entity,
+        handlers::idea_boards::get_board,
+        handlers::idea_boards::update_board,
+        handlers::idea_boards::delete_board,
+        handlers::idea_boards::create_sticky,
+        handlers::idea_boards::list_stickies,
+        handlers::idea_boards::get_sticky_by_entity,
+        handlers::idea_boards::update_sticky,
+        handlers::idea_boards::delete_sticky,
+        handlers::idea_boards::create_shape,
+        handlers::idea_boards::list_shapes,
+        handlers::idea_boards::update_shape,
+        handlers::idea_boards::delete_shape,
+        handlers::idea_boards::create_link,
+        handlers::idea_boards::list_links,
+        handlers::idea_boards::update_link,
+        handlers::idea_boards::delete_link,
         handlers::search::search,
         handlers::spaces::create_space,
         handlers::spaces::list_spaces,
@@ -115,6 +134,19 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         models::system_principal::SystemPrincipal,
         models::system_principal::CreateSystemPrincipalRequest,
         models::system_principal::SystemPrincipalsPage,
+        models::idea_board::IdeaBoardsPage,
+        models::idea_board::Sticky,
+        models::idea_board::StickiesPage,
+        models::idea_board::CreateStickyRequest,
+        models::idea_board::UpdateStickyRequest,
+        models::idea_board::BoardShape,
+        models::idea_board::BoardShapesPage,
+        models::idea_board::CreateBoardShapeRequest,
+        models::idea_board::UpdateBoardShapeRequest,
+        models::idea_board::NoteLink,
+        models::idea_board::NoteLinksPage,
+        models::idea_board::CreateNoteLinkRequest,
+        models::idea_board::UpdateNoteLinkRequest,
         search::SearchHit,
         search::SearchTypeResults,
         search::SearchResults,
@@ -286,6 +318,42 @@ async fn main() -> Result<()> {
             post(handlers::system_principals::create_system_principal).get(handlers::system_principals::list_system_principals),
         )
         .route("/system-principals/:id", axum::routing::delete(handlers::system_principals::delete_system_principal))
+        .route(
+            "/idea-boards",
+            post(handlers::idea_boards::create_board).get(handlers::idea_boards::list_boards),
+        )
+        .route("/idea-boards/by-entity", get(handlers::idea_boards::list_boards_by_entity))
+        .route(
+            "/idea-boards/:id",
+            get(handlers::idea_boards::get_board)
+                .patch(handlers::idea_boards::update_board)
+                .delete(handlers::idea_boards::delete_board),
+        )
+        .route(
+            "/idea-boards/:id/stickies",
+            post(handlers::idea_boards::create_sticky).get(handlers::idea_boards::list_stickies),
+        )
+        .route(
+            "/idea-boards/:id/shapes",
+            post(handlers::idea_boards::create_shape).get(handlers::idea_boards::list_shapes),
+        )
+        .route(
+            "/idea-boards/:id/links",
+            post(handlers::idea_boards::create_link).get(handlers::idea_boards::list_links),
+        )
+        .route("/stickies/by-entity", get(handlers::idea_boards::get_sticky_by_entity))
+        .route(
+            "/stickies/:note_id",
+            axum::routing::patch(handlers::idea_boards::update_sticky).delete(handlers::idea_boards::delete_sticky),
+        )
+        .route(
+            "/shapes/:id",
+            axum::routing::patch(handlers::idea_boards::update_shape).delete(handlers::idea_boards::delete_shape),
+        )
+        .route(
+            "/links/:id",
+            axum::routing::patch(handlers::idea_boards::update_link).delete(handlers::idea_boards::delete_link),
+        )
         .route("/search", get(handlers::search::search))
         .route("/spaces", post(handlers::spaces::create_space).get(handlers::spaces::list_spaces))
         .route("/spaces/:id", axum::routing::patch(handlers::spaces::update_space))
