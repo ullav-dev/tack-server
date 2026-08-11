@@ -157,7 +157,7 @@ pub struct NoteAttachment {
 /// omitted (don't touch), `null` (unfile), or a value (move/assign). Wraps
 /// the outcome in a second `Option`, so `None` = omitted, `Some(None)` =
 /// explicit null, `Some(Some(id))` = a value.
-fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,
@@ -214,6 +214,13 @@ pub struct NoteFolder {
     pub organization_id: Uuid,
     pub team_id: Uuid,
     pub name: String,
+    /// `"general"` (the default, an ordinary Notes folder) or `"ideas_board"`
+    /// (an Idea Board -- see `011_idea_boards.sql` and `handlers::idea_boards`).
+    /// Board-specific endpoints only ever operate on `"ideas_board"` rows;
+    /// `GET /note-folders` and friends return both kinds today (a board is
+    /// still a folder), matching the DB's own "a board is just a note_folders
+    /// row with folder_type = 'ideas_board'" framing.
+    pub folder_type: String,
     pub owning_service: Option<String>,
     pub entity_type: Option<String>,
     pub entity_id: Option<String>,
@@ -235,6 +242,27 @@ pub struct CreateNoteFolderRequest {
     /// leaving it team-wide -- see `NoteFolder`'s doc comment.
     #[serde(default)]
     pub attach: Option<AttachRequest>,
+}
+
+/// Server-side-only distinction between an ordinary folder and an Idea
+/// Board -- not part of `CreateNoteFolderRequest`'s own JSON body.
+/// `handlers::idea_boards::create_board` builds a `CreateNoteFolderRequest`
+/// internally and passes `IdeasBoard` explicitly rather than trusting a
+/// client-supplied `folder_type` field on the general `POST /note-folders`
+/// endpoint (which always creates `General`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderType {
+    General,
+    IdeasBoard,
+}
+
+impl FolderType {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            FolderType::General => "general",
+            FolderType::IdeasBoard => "ideas_board",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

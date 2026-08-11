@@ -1,3 +1,4 @@
+pub mod idea_boards;
 pub mod note_folders;
 pub mod note_reads;
 pub mod notes;
