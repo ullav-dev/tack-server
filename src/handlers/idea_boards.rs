@@ -55,6 +55,30 @@ fn clamp_page(limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
     (limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT), offset.unwrap_or(0).max(0))
 }
 
+/// Backfill-only `created_by` resolution, shared by `create_sticky`/
+/// `create_shape`/`create_link` -- exact same rule as
+/// `handlers::notes::create_note`'s: an admin may attribute to anyone, a
+/// non-admin may attribute to an *existing system principal in this same
+/// organization* (verified by a real DB lookup, never trusted blindly), and
+/// any other claimed `created_by` from a non-admin is silently ignored.
+async fn resolve_backfill_created_by(
+    state: &AppState,
+    user: &TackUser,
+    organization_id: Uuid,
+    claimed: Option<Uuid>,
+) -> AppResult<Uuid> {
+    Ok(if user.is_admin {
+        claimed.unwrap_or(user.user_id)
+    } else if let Some(claimed) = claimed {
+        match db::system_principals::get_principal(&state.db, claimed, organization_id).await? {
+            Some(_) => claimed,
+            None => user.user_id,
+        }
+    } else {
+        user.user_id
+    })
+}
+
 /// Resolves a bare id to a board, 404ing (not 403/400) if it exists but is
 /// an ordinary Notes folder -- see this module's doc comment.
 async fn resolve_board_for_caller(state: &AppState, user: &TackUser, id: Uuid) -> AppResult<IdeaBoard> {
@@ -266,6 +290,10 @@ pub async fn create_sticky(
     if body.linked_entity_type.is_some() != body.linked_entity_id.is_some() {
         return Err(AppError::BadRequest("linked_entity_type and linked_entity_id must be set together.".into()));
     }
+    let created_by = resolve_backfill_created_by(&state, &user, board.organization_id, body.created_by).await?;
+    // Backfill-only: only an admin caller's created_at override is honored,
+    // same as CreateNoteRequest::created_at.
+    let created_at = if user.is_admin { body.created_at.unwrap_or_else(chrono::Utc::now) } else { chrono::Utc::now() };
     let sticky = db::idea_boards::create_sticky(
         &state.db,
         &board,
@@ -280,7 +308,8 @@ pub async fn create_sticky(
             linked_entity_type: body.linked_entity_type,
             linked_entity_id: body.linked_entity_id,
         },
-        user.user_id,
+        created_by,
+        created_at,
     )
     .await?;
     Ok(Json(sticky))
@@ -434,6 +463,8 @@ pub async fn create_shape(
         return Err(AppError::BadRequest(format!("Invalid shape_type: {}", body.shape_type)));
     }
     let board = resolve_board_for_caller(&state, &user, board_id).await?;
+    let created_by = resolve_backfill_created_by(&state, &user, board.organization_id, body.created_by).await?;
+    let created_at = if user.is_admin { body.created_at.unwrap_or_else(chrono::Utc::now) } else { chrono::Utc::now() };
     let shape = db::idea_boards::create_shape(
         &state.db,
         &board,
@@ -451,7 +482,8 @@ pub async fn create_shape(
             label_size: body.label_size,
             image_url: body.image_url,
         },
-        user.user_id,
+        created_by,
+        created_at,
     )
     .await?;
     Ok(Json(shape))
@@ -600,6 +632,8 @@ pub async fn create_link(
         }
     }
 
+    let created_by = resolve_backfill_created_by(&state, &user, board.organization_id, body.created_by).await?;
+    let created_at = if user.is_admin { body.created_at.unwrap_or_else(chrono::Utc::now) } else { chrono::Utc::now() };
     let link = db::idea_boards::create_link(
         &state.db,
         &board,
@@ -612,7 +646,8 @@ pub async fn create_link(
             to_port: body.to_port,
             label: body.label,
         },
-        user.user_id,
+        created_by,
+        created_at,
     )
     .await?;
     Ok(Json(link))
