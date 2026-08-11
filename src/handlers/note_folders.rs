@@ -42,18 +42,41 @@ pub async fn resolve_folder_for_caller(state: &AppState, user: &TackUser, id: Uu
 /// into a folder and neither should silently accept a folder from a
 /// different team (or one that doesn't exist). `caller_id` only affects the
 /// returned `note_count` (unused here), but `get_folder` requires it.
+///
+/// `note_attachments` is every entity this note is (or is about to be)
+/// attached to, as `(owning_service, entity_type, entity_id)` triples. If
+/// the target folder is entity-scoped, at least one of them must match it
+/// *exactly*, or a note attached to ticket A could be filed into ticket B's
+/// folder despite never appearing in ticket B's own note list. A team-wide
+/// folder (the common case) has no such requirement, same as before this
+/// check existed. A note can in principle carry more than one attachment
+/// (`POST /notes/{id}/attachments`), hence a slice rather than a single
+/// optional triple.
 pub async fn check_folder_in_team(
     state: &AppState,
     organization_id: Uuid,
     team_id: Uuid,
     folder_id: Uuid,
     caller_id: Uuid,
+    note_attachments: &[(&str, &str, &str)],
 ) -> AppResult<()> {
     let folder = db::note_folders::get_folder(&state.db, folder_id, organization_id, caller_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("folder_id does not refer to an existing folder.".into()))?;
     if folder.team_id != team_id {
         return Err(AppError::BadRequest("folder_id must belong to the note's own team.".into()));
+    }
+    if let (Some(folder_owning_service), Some(folder_entity_type), Some(folder_entity_id)) =
+        (&folder.owning_service, &folder.entity_type, &folder.entity_id)
+    {
+        let matches = note_attachments
+            .iter()
+            .any(|(s, t, id)| s == folder_owning_service && t == folder_entity_type && id == folder_entity_id);
+        if !matches {
+            return Err(AppError::BadRequest(
+                "folder_id belongs to an entity-scoped folder for a different entity than this note is attached to.".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -76,8 +99,62 @@ pub async fn create_note_folder(
         return Err(AppError::BadRequest("name must not be empty".into()));
     }
     let organization_id = resolve_team_organization_live(&state, &user, &raw_token, body.team_id).await?;
-    let folder = db::note_folders::create_folder(&state.db, organization_id, body.team_id, name, user.user_id).await?;
+    let folder =
+        db::note_folders::create_folder(&state.db, organization_id, body.team_id, name, user.user_id, body.attach.as_ref())
+            .await?;
     Ok(Json(folder))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListNoteFoldersByAttachmentQuery {
+    pub owning_service: String,
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
+/// One entity's own folders (e.g. a cunav ticket's sub-folders) -- the
+/// folder analogue of `handlers::notes::list_notes_by_attachment`, same
+/// "scan the caller's orgs, first org with any *visible* rows wins" shape
+/// and same reasoning for why that's fine (an entity's folders only ever
+/// belong to one organization in practice). Folders carry no visibility
+/// tier of their own (see `NoteFolder`'s doc comment), but they do still
+/// belong to a team, and the DB query is organization-scoped only -- so
+/// every row is filtered to the caller's own team memberships before being
+/// counted, the same shape `list_note_folders` below already applies via
+/// its explicit `team_ids` list (this endpoint just can't build that list
+/// up front, since it isn't given a team_id, only an entity).
+#[utoipa::path(
+    get,
+    path = "/note-folders/by-entity",
+    params(
+        ("owning_service" = String, Query, description = "Namespacing service, e.g. \"cunav\""),
+        ("entity_type" = String, Query, description = "e.g. \"workflow\""),
+        ("entity_id" = String, Query, description = "The external entity's own id"),
+    ),
+    responses((status = 200, description = "This entity's own folders", body = [NoteFolder])),
+    tag = "notes"
+)]
+pub async fn list_note_folders_by_attachment(
+    State(state): State<AppState>,
+    user: TackUser,
+    Query(query): Query<ListNoteFoldersByAttachmentQuery>,
+) -> AppResult<Json<Vec<NoteFolder>>> {
+    for organization_id in user.organization_ids() {
+        let folders = db::note_folders::list_folders_for_entity(
+            &state.db,
+            organization_id,
+            &query.owning_service,
+            &query.entity_type,
+            &query.entity_id,
+            user.user_id,
+        )
+        .await?;
+        let visible: Vec<_> = folders.into_iter().filter(|f| user.is_admin || user.teams.contains_key(&f.team_id)).collect();
+        if !visible.is_empty() {
+            return Ok(Json(visible));
+        }
+    }
+    Ok(Json(Vec::new()))
 }
 
 const DEFAULT_FOLDERS_LIMIT: i64 = 25;
