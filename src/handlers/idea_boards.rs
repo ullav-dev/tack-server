@@ -343,6 +343,17 @@ pub async fn list_stickies(
     Ok(Json(StickiesPage { stickies, total }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/stickies/{note_id}",
+    responses((status = 200, description = "A single sticky", body = Sticky)),
+    tag = "idea-boards"
+)]
+pub async fn get_sticky(State(state): State<AppState>, user: TackUser, Path(note_id): Path<Uuid>) -> AppResult<Json<Sticky>> {
+    let sticky = resolve_sticky_for_caller(&state, &user, note_id).await?;
+    Ok(Json(sticky))
+}
+
 /// Resolves a sticky by its note id, verifying its board is visible to the
 /// caller (team-membership) -- shared by every mutating sticky endpoint
 /// below.
