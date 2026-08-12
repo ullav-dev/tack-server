@@ -80,6 +80,7 @@ async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<
         handlers::idea_boards::delete_board,
         handlers::idea_boards::create_sticky,
         handlers::idea_boards::list_stickies,
+        handlers::idea_boards::get_sticky,
         handlers::idea_boards::get_sticky_by_entity,
         handlers::idea_boards::update_sticky,
         handlers::idea_boards::delete_sticky,
@@ -344,7 +345,9 @@ async fn main() -> Result<()> {
         .route("/stickies/by-entity", get(handlers::idea_boards::get_sticky_by_entity))
         .route(
             "/stickies/:note_id",
-            axum::routing::patch(handlers::idea_boards::update_sticky).delete(handlers::idea_boards::delete_sticky),
+            get(handlers::idea_boards::get_sticky)
+                .patch(handlers::idea_boards::update_sticky)
+                .delete(handlers::idea_boards::delete_sticky),
         )
         .route(
             "/shapes/:id",
