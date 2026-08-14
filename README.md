@@ -15,21 +15,9 @@ Both content types share one Postgres-backed storage layer, one hybrid (lexical 
 
 ## Architecture
 
-```
-┌─────────────┐      ┌──────────────┐      ┌───────────────┐
-│  tack (UI)  │─────▶│ tack-server  │─────▶│   Postgres    │  (source of truth)
-└─────────────┘      │  (this repo) │      └───────────────┘
-       │              └──────┬───────┘
-       │                     │ outbox_events
-       │              ┌──────▼───────┐      ┌───────────────┐
-       │              │ tack-indexer │─────▶│  OpenSearch   │  (rebuildable index)
-       │              └──────────────┘      └───────────────┘
-       │
-       ▼ (WebSocket, direct — not proxied)
-┌────────────────┐
-│ tack-hocuspocus│  real-time Yjs sync for Pages
-└────────────────┘
-```
+![Tack Platform — Backend Architecture](docs/architecture.svg)
+
+*(Source: [`docs/architecture.svg`](docs/architecture.svg) — a single self-contained SVG, safe to drop directly into a slide deck or export to PNG; regenerate/edit by hand, no build step or diagramming tool required.)*
 
 - **Postgres is the only source of truth.** OpenSearch is a secondary, fully rebuildable index, fed by a transactional outbox (`outbox_events`) rather than dual-written from the API layer.
 - **Tenant sharding**: every content table is hash-partitioned by `organization_id` (32 fixed buckets) from the first migration — Organizations are a new, additive tenant concept living in `ullav-user-management`, one level above Team.
