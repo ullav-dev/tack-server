@@ -15,12 +15,19 @@ static MIGRATIONS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 pub type DbPool = Pool;
 
-pub fn create_pool(database_url: &str) -> Result<Pool> {
+/// `max_size` should always be passed explicitly (see
+/// `Config::db_pool_max_size`'s own doc comment) -- `deadpool_postgres`'s
+/// own default (`num_cpus::get() * 2`) has the same host-core-count-leakage
+/// problem `Config::embedding_intra_threads`/`tokio_worker_threads` already
+/// document: `num_cpus` reads the *host's* full core count under most
+/// container schedulers, not the pod's actual CPU allotment.
+pub fn create_pool(database_url: &str, max_size: usize) -> Result<Pool> {
     let mut cfg = PgConfig::new();
     cfg.url = Some(database_url.to_string());
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(max_size));
 
     cfg.create_pool(Some(Runtime::Tokio1), NoTls)
         .context("Failed to create database pool")

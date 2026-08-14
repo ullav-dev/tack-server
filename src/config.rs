@@ -24,6 +24,30 @@ pub struct Config {
     /// runs off the write path, via the outbox worker, or once per search
     /// query -- never a hot synchronous path).
     pub embedding_intra_threads: usize,
+    /// Tokio runtime worker thread count. Same host-core-count-leakage
+    /// problem as `embedding_intra_threads` (see its own doc comment), one
+    /// level up the stack: `#[tokio::main]`'s default multi-thread runtime
+    /// sizes its worker pool to `std::thread::available_parallelism()`,
+    /// which is the *host's* full core count under most container
+    /// schedulers, not the pod's actual CPU allotment. Each worker is its
+    /// own OS thread (default 2MiB stack) plus its own scheduler queues --
+    /// on a many-core node this is real, unbounded baseline memory that has
+    /// nothing to do with actual request concurrency. A small fixed default
+    /// is still comfortably enough for this service's real load (a handful
+    /// of concurrent requests, not thousands).
+    pub tokio_worker_threads: usize,
+    /// Postgres connection pool ceiling. `deadpool`'s own default (used if
+    /// this were left unset) is `num_cpus::get() * 2` -- the exact same
+    /// host-core-count leakage as the two fields above (`num_cpus`, like
+    /// `available_parallelism()`, reads `sched_getaffinity`). On a busy
+    /// many-core node this pool ceiling could be 60-100+, and each actually-
+    /// opened connection (this service's own client-side buffers, not just
+    /// the Postgres server's backend process) is real memory that scales
+    /// with how much of that ceiling the caller's own concurrency actually
+    /// reaches -- unlike the two fields above, this one only matters under
+    /// real load, not at startup, which is why it wasn't caught by the
+    /// startup-OOM investigation that found the other two.
+    pub db_pool_max_size: usize,
 }
 
 impl Config {
@@ -66,6 +90,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            tokio_worker_threads: std::env::var("TOKIO_WORKER_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
+            db_pool_max_size: std::env::var("DB_POOL_MAX_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
         })
     }
 

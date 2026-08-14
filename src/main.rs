@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::State,
     http::{Request, StatusCode},
@@ -199,8 +199,13 @@ async fn health(State(state): State<AppState>) -> StatusCode {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Not `#[tokio::main]` -- see `Config::tokio_worker_threads`'s own doc
+/// comment. That macro's default multi-thread runtime sizes its worker pool
+/// to `std::thread::available_parallelism()`, the *host's* full core count
+/// under most container schedulers, not this pod's actual CPU allotment;
+/// building the runtime manually here lets that be capped via `Config`
+/// (loaded synchronously, before any runtime exists to size).
+fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())
@@ -210,7 +215,16 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
 
-    let pool = db::create_pool(&cfg.database_url)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg.tokio_worker_threads)
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?
+        .block_on(run(cfg))
+}
+
+async fn run(cfg: Config) -> Result<()> {
+    let pool = db::create_pool(&cfg.database_url, cfg.db_pool_max_size)?;
     db::run_migrations(&pool).await?;
 
     // OpenSearch is a secondary, rebuildable index -- Postgres (already

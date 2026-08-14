@@ -30,7 +30,7 @@
 //! touch `outbox_events` at all, and it runs fully independently of (and
 //! can overlap with) the normal poll loop.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tack_server::{config::Config, db, embeddings::Embedder, search::SearchClient};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -48,8 +48,10 @@ struct OutboxEvent {
     event_type: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Not `#[tokio::main]` -- see `Config::tokio_worker_threads`'s own doc
+/// comment (`src/config.rs`) and `tack-server`'s own `main.rs`, which has
+/// the identical restructuring for the identical reason.
+fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())
@@ -58,9 +60,18 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cfg = Config::from_env()?;
 
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg.tokio_worker_threads)
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?
+        .block_on(run(cfg))
+}
+
+async fn run(cfg: Config) -> Result<()> {
     // Own pool, separate from tack-server's — a backfill/indexing burst here
     // must never starve the API server's request-serving connections.
-    let pool = db::create_pool(&cfg.database_url)?;
+    let pool = db::create_pool(&cfg.database_url, cfg.db_pool_max_size)?;
     let search = SearchClient::new(cfg.opensearch_url);
     search.ensure_index().await?;
 

@@ -58,6 +58,9 @@ EMBEDDING_MODEL_CACHE_DIR=./.embedding-models
 EMBEDDING_INTRA_THREADS=1   # see src/config.rs — do not raise this in a
                             # memory-constrained deployment without reading
                             # its doc comment first (production OOM history)
+TOKIO_WORKER_THREADS=4      # same host-core-count-leakage problem, one
+DB_POOL_MAX_SIZE=10         # level up (Tokio runtime) and one down
+                            # (Postgres pool) — see src/config.rs
 
 # Not in .env.example yet, but read by src/config.rs — set explicitly if
 # your local setup needs a non-default value:

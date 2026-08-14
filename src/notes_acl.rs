@@ -264,7 +264,7 @@ mod tests {
     /// the tests below.
     fn app_state(user_management_base_url: &str) -> crate::AppState {
         crate::AppState {
-            db: db::create_pool("postgresql://test:test@localhost/test").expect("pool config"),
+            db: db::create_pool("postgresql://test:test@localhost/test", 1).expect("pool config"),
             api_validator: ullav_mcp_auth::TokenValidator::new("http://localhost/jwks", "http://localhost", ""),
             search: crate::search::SearchClient::new("http://localhost:9200"),
             embedder: None,
