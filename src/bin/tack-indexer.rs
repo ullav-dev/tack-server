@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
     // just needs a re-index, not a code change.
     let embedder = {
         let cache_dir = cfg.embedding_model_cache_dir.clone();
-        match tokio::task::spawn_blocking(move || Embedder::new(cache_dir)).await {
+        let intra_threads = cfg.embedding_intra_threads;
+        match tokio::task::spawn_blocking(move || Embedder::new(cache_dir, intra_threads)).await {
             Ok(Ok(embedder)) => Some(embedder),
             Ok(Err(e)) => {
                 tracing::warn!("embedding model failed to load, indexing lexical-only: {e:#}");

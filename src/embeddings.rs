@@ -50,11 +50,20 @@ impl Embedder {
     /// per-embedding API call; bake the model into the Docker image (or
     /// pre-warm the cache volume) in any environment without outbound
     /// internet access.
-    pub fn new(cache_dir: PathBuf) -> Result<Self> {
+    ///
+    /// `intra_threads` caps ONNX Runtime's own thread pool explicitly --
+    /// see `Config::embedding_intra_threads`'s doc comment for why this
+    /// can't be left at `fastembed`'s own default
+    /// (`std::thread::available_parallelism()`, which a container scheduler
+    /// without cpuset pinning leaves reporting the *host's* full core
+    /// count, not the pod's actual allotment -- a real production OOM
+    /// during startup, not a hypothetical one).
+    pub fn new(cache_dir: PathBuf, intra_threads: usize) -> Result<Self> {
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::MultilingualE5Small)
                 .with_cache_dir(cache_dir)
-                .with_show_download_progress(false),
+                .with_show_download_progress(false)
+                .with_intra_threads(intra_threads),
         )
         .context("failed to load embedding model")?;
         Ok(Self { inner: Arc::new(Mutex::new(model)) })
@@ -76,7 +85,10 @@ impl Embedder {
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            let model = inner.lock().expect("embedding model mutex poisoned");
+            // fastembed 5's TextEmbedding::embed takes &mut self (it didn't
+            // in 4.x) -- MutexGuard needs `mut` on its own binding to hand
+            // out that &mut through DerefMut.
+            let mut model = inner.lock().expect("embedding model mutex poisoned");
             model.embed(texts, None)
         })
         .await
