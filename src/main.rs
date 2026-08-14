@@ -9,7 +9,10 @@ use axum::{
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use ullav_mcp_auth::{mcp_auth_middleware, protected_resource_metadata, McpClaims, ProtectedResourceConfig, TokenValidator};
+use ullav_mcp_auth::{
+    mcp_auth_middleware, protected_resource_metadata, unauthorized_response, McpClaims,
+    ProtectedResourceConfig, TokenValidator,
+};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -28,14 +31,75 @@ fn host_from_uri(uri: &str) -> &str {
     without_scheme.split('/').next().unwrap_or(without_scheme)
 }
 
+/// Builds the RFC 9728 `resource_metadata` URL for a given MCP resource URI
+/// (e.g. `http://localhost:8087/mcp` -> `http://localhost:8087/.well-known/
+/// oauth-protected-resource/mcp`) — the same well-known path this service
+/// actually registers `protected_resource_metadata` under, so a client that
+/// follows the header lands on a real endpoint.
+fn resource_metadata_url(resource_uri: &str) -> String {
+    let path_start = resource_uri
+        .find("://")
+        .and_then(|i| resource_uri[i + 3..].find('/').map(|j| i + 3 + j))
+        .unwrap_or(resource_uri.len());
+    let (origin, path) = resource_uri.split_at(path_start);
+    format!("{origin}/.well-known/oauth-protected-resource{path}")
+}
+
 /// Gates the MCP endpoint on the `tack:tools` scope — mirrors
-/// ullav-dam-server's `dam_scope_guard`.
-async fn tack_scope_guard(req: Request<axum::body::Body>, next: Next) -> Result<Response, StatusCode> {
-    let claims = req.extensions().get::<McpClaims>().ok_or(StatusCode::UNAUTHORIZED)?;
+/// ullav-dam-server's `dam_scope_guard`. Uses
+/// `ullav_mcp_auth::unauthorized_response` to build the RFC 9728
+/// `WWW-Authenticate` challenge on rejection, rather than falling through to
+/// a bare `StatusCode` (which drops the header — a client relying on
+/// discovery via the header, rather than already knowing the metadata URL,
+/// can't complete the OAuth flow at all).
+async fn tack_scope_guard(
+    Extension(prc): Extension<ProtectedResourceConfig>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, Response> {
+    let metadata_url = resource_metadata_url(&prc.resource_uri);
+    let claims = req
+        .extensions()
+        .get::<McpClaims>()
+        .ok_or_else(|| unauthorized_response(&metadata_url, "tack:tools"))?;
     if !claims.scope.split_whitespace().any(|s| s == "tack:tools") {
-        return Err(StatusCode::FORBIDDEN);
+        // insufficient_scope is a 403, not a 401, but RFC 6750 still calls
+        // for the challenge header so the client can see what scope it's
+        // missing — reuse the same header, just override the status.
+        let mut resp = unauthorized_response(&metadata_url, "tack:tools");
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return Err(resp);
     }
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod scope_guard_tests {
+    use super::resource_metadata_url;
+
+    #[test]
+    fn builds_well_known_url_alongside_the_resource_path() {
+        assert_eq!(
+            resource_metadata_url("http://localhost:8087/mcp"),
+            "http://localhost:8087/.well-known/oauth-protected-resource/mcp"
+        );
+    }
+
+    #[test]
+    fn handles_a_bare_origin_with_no_path() {
+        assert_eq!(
+            resource_metadata_url("https://tack.example.com"),
+            "https://tack.example.com/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[test]
+    fn preserves_a_nested_path() {
+        assert_eq!(
+            resource_metadata_url("https://example.com:8443/svc/mcp"),
+            "https://example.com:8443/.well-known/oauth-protected-resource/svc/mcp"
+        );
+    }
 }
 
 #[derive(OpenApi)]
