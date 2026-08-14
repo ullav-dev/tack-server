@@ -229,7 +229,8 @@ async fn main() -> Result<()> {
     // never a startup requirement.
     let embedder = {
         let cache_dir = cfg.embedding_model_cache_dir.clone();
-        match tokio::task::spawn_blocking(move || embeddings::Embedder::new(cache_dir)).await {
+        let intra_threads = cfg.embedding_intra_threads;
+        match tokio::task::spawn_blocking(move || embeddings::Embedder::new(cache_dir, intra_threads)).await {
             Ok(Ok(embedder)) => Some(embedder),
             Ok(Err(e)) => {
                 tracing::warn!("embedding model failed to load, continuing lexical-only: {e:#}");

@@ -54,11 +54,14 @@ OAUTH2_JWKS_URL=http://localhost:8081/oauth2/jwks   # ullav-user-management
 OAUTH2_ISSUER=http://localhost:8081                 # ullav-user-management
 OPENSEARCH_URL=http://localhost:9200
 RUST_LOG=info
+EMBEDDING_MODEL_CACHE_DIR=./.embedding-models
+EMBEDDING_INTRA_THREADS=1   # see src/config.rs — do not raise this in a
+                            # memory-constrained deployment without reading
+                            # its doc comment first (production OOM history)
 
 # Not in .env.example yet, but read by src/config.rs — set explicitly if
 # your local setup needs a non-default value:
 # TACK_MCP_CANONICAL_URI=http://localhost:8087/mcp
-# EMBEDDING_MODEL_CACHE_DIR=./.embedding-models
 ```
 
 ### Running locally

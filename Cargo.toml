@@ -60,7 +60,7 @@ include_dir = "0.7"
 # Self-hosted local embedding model (ONNX Runtime under the hood, via `ort`) —
 # no external API calls or per-embedding cost, per the explicit decision to
 # keep semantic search self-hosted rather than calling an external provider.
-fastembed = "4"
+fastembed = "5"
 
 [profile.release]
 opt-level = 3

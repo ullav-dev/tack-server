@@ -16,6 +16,14 @@ pub struct Config {
     /// run if absent). Point this at a persistent volume in any deployed
     /// environment so the model survives container restarts/redeploys.
     pub embedding_model_cache_dir: std::path::PathBuf,
+    /// ONNX Runtime intra-op thread count for the embedding model. Default
+    /// (1) is deliberately conservative, not tuned for throughput -- see the
+    /// doc comment on the env var default below for why. Raise this if the
+    /// deployment environment has memory headroom to spare and embedding
+    /// throughput is actually a bottleneck (it isn't expected to be: this
+    /// runs off the write path, via the outbox worker, or once per search
+    /// query -- never a hot synchronous path).
+    pub embedding_intra_threads: usize,
 }
 
 impl Config {
@@ -38,6 +46,26 @@ impl Config {
             embedding_model_cache_dir: std::env::var("EMBEDDING_MODEL_CACHE_DIR")
                 .unwrap_or_else(|_| "./.embedding-models".into())
                 .into(),
+            // `fastembed`'s own default (used if this were left unset) is
+            // `std::thread::available_parallelism()` -- on Linux this reads
+            // the process's CPU affinity mask via `sched_getaffinity`, which
+            // most container schedulers (Kubernetes' default `none` CPU
+            // Manager policy included -- CFS quota/period throttling, not
+            // cpuset pinning) leave unrestricted to the *host's* full core
+            // count, not the pod's actual `resources` allotment. On a node
+            // with many cores this drove ONNX Runtime to spin up one
+            // intra-op thread (and its own memory arena) per host core
+            // during session creation, OOM-killing the process before
+            // startup ever reaches "Listening on" -- confirmed as the root
+            // cause of a production deploy failure (every node in the
+            // cluster hit it, "even in isolation", because the host core
+            // count -- not the pod's memory limit -- was driving the
+            // allocation). A small fixed default sidesteps this entirely,
+            // independent of whatever the cluster's CPU Manager policy is.
+            embedding_intra_threads: std::env::var("EMBEDDING_INTRA_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
         })
     }
 
