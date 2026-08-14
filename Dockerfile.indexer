@@ -4,7 +4,11 @@
 # with the API server's request-serving resources.
 #
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.91-slim-bookworm AS builder
+# trixie, not bookworm -- see Dockerfile's own comment: ort-sys's prebuilt
+# onnxruntime binary needs glibc >= 2.38 and a newer libstdc++ ABI than
+# bookworm ships. The runtime stage below must match for the same reason
+# (a binary linked against newer glibc symbols won't run on an older one).
+FROM rust:1.91-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -39,7 +43,7 @@ COPY migrations ./migrations
 RUN cargo build --release --bin tack-indexer
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \

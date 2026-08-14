@@ -1,5 +1,17 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.91-slim-bookworm AS builder
+# trixie (Debian 13), not bookworm (Debian 12): ort-sys's prebuilt onnxruntime
+# binary (pulled in transitively via the fastembed 5.x upgrade -- see
+# CLAUDE.md's "Production startup OOM" note) requires glibc >= 2.38
+# (references __isoc23_strtoll/strtoull/strtol, C23-conformance symbol
+# variants only glibc 2.38+ exports) and a libstdc++ ABI bookworm's GCC 12
+# doesn't have (`_M_replace_cold`). bookworm ships glibc 2.36 -- linking
+# failed outright with "undefined symbol" errors for both, confirmed via a
+# real `docker build`, not just `cargo build` locally (this dependency only
+# gets linked in the actual release build, not `cargo check`). The runtime
+# stage below must use a matching trixie-based image too -- a binary linked
+# against glibc 2.38+ symbols won't run on an older glibc at all, so bumping
+# only this stage would trade a build failure for a runtime crash instead.
+FROM rust:1.91-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -38,7 +50,7 @@ COPY migrations ./migrations
 RUN cargo build --release
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
