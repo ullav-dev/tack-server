@@ -3882,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "tack-server"
-version = "0.1.0"
+version = "26.2.0"
 dependencies = [
  "anyhow",
  "axum",
