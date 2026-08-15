@@ -22,7 +22,7 @@ Both content types share one Postgres-backed storage layer, one hybrid (lexical 
 - **Postgres is the only source of truth.** OpenSearch is a secondary, fully rebuildable index, fed by a transactional outbox (`outbox_events`) rather than dual-written from the API layer.
 - **Tenant sharding**: every content table is hash-partitioned by `organization_id` (32 fixed buckets) from the first migration — Organizations are a new, additive tenant concept living in `ullav-user-management`, one level above Team.
 - **Two binaries, one crate**: `tack-server` (the API) and `tack-indexer` (the outbox-draining OpenSearch worker) share this crate's lib code but run and scale as separate processes/containers.
-- **Auth** is `ullav-mcp-auth`'s shared JWT validator, same as every other first-party Ullav service — a team must have the `tack` product slug enabled for its members to use Tack (admin accounts bypass this gate).
+- **Auth** is `ullav-mcp-auth`'s shared JWT validator, same as every other first-party Ullav service. Unlike every other first-party app, there is **no** per-team `tack` product-slug gate — any team the caller belongs to is usable (admins are exempt from needing a team at all). See `CLAUDE.md`'s Auth entry for why.
 
 ## Tech stack
 

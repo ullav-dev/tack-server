@@ -14,9 +14,6 @@ use crate::{error::AppError, AppState};
 struct TeamClaim {
     #[serde(default)]
     role: String,
-    /// Product slugs this team has enabled (from `team_product_access`).
-    #[serde(default)]
-    products: Vec<String>,
     /// The team's organization, if it has one — see the Organizations migration
     /// in ullav-user-management. Most teams don't have one yet; that's expected.
     #[serde(default)]
@@ -34,8 +31,7 @@ struct Claims {
 
 // ── TackUser extractor ─────────────────────────────────────────────────────────
 
-/// One team the caller belongs to that has Tack access (the `tack` product
-/// enabled), with its organization if it has one.
+/// One team the caller belongs to, with its organization if it has one.
 #[derive(Debug, Clone)]
 pub struct TackTeamMembership {
     pub role: String,
@@ -44,16 +40,24 @@ pub struct TackTeamMembership {
 
 /// Authenticated Tack user extracted from the `Authorization: Bearer` header.
 ///
-/// Requires the caller to be an admin, or a member of at least one team with
-/// the `tack` product enabled — same team-granted access-gate pattern used by
-/// every other first-party Ullav app (Togra/Cunav/Cartlann/Lagan).
+/// Requires the caller to be an admin, or a member of at least one team —
+/// any team, full stop. **Not** gated on a `tack` product slug being
+/// enabled per-team, unlike every other first-party Ullav app's own gate
+/// (Togra/Cunav/Cartlann/Lagan still do their own) — deliberately removed
+/// here: Tack backs Notes/Pages for all of those apps now, so an opt-in
+/// per-team product gate stopped making sense as soon as it became load-
+/// bearing infrastructure rather than a standalone product a team chooses
+/// to adopt. Every *other* access decision (which notes/pages a caller can
+/// actually see) is completely unaffected by this and still fully enforced
+/// live, per-request, in `notes_acl.rs`/`pages_acl.rs` — this only ever
+/// gated whether the caller gets a `TackUser` at all, never which content
+/// within Tack they could see once they had one.
 #[derive(Debug, Clone)]
 pub struct TackUser {
     pub user_id: Uuid,
     pub is_admin: bool,
-    /// Only teams with `tack` enabled — teams without it are invisible to Tack,
-    /// same as togra's frontend-side `getTograTeamIds` filtering, just enforced
-    /// server-side here.
+    /// Every team the caller belongs to (no product-gate filtering — see
+    /// this struct's own doc comment).
     pub teams: HashMap<Uuid, TackTeamMembership>,
 }
 
@@ -72,18 +76,23 @@ impl TackUser {
 /// Shared "sub/roles/teams -> TackUser" logic, used by both the REST
 /// `FromRequestParts` extractor (general API JWT) and `from_mcp_claims`
 /// (audience-bound MCP token) — same access-gate rules either way.
+///
+/// No product-gate filtering on `teams` — see `TackUser`'s own doc comment
+/// for why. Every team present in the token's own claims is kept as-is;
+/// `ullav-user-management` (the token issuer) is still the one deciding
+/// which teams a caller belongs to at all, this just no longer narrows
+/// that down further by product enablement.
 fn build_tack_user<'a>(
     sub: &str,
     roles: &[String],
-    teams: impl IntoIterator<Item = (&'a String, &'a str, &'a [String], Option<&'a str>)>,
+    teams: impl IntoIterator<Item = (&'a String, &'a str, Option<&'a str>)>,
 ) -> Result<TackUser, AppError> {
     let user_id = sub.parse::<Uuid>().map_err(|_| AppError::Unauthorized("Invalid subject in token".into()))?;
     let is_admin = roles.iter().any(|r| r == "admin");
 
     let team_map: HashMap<Uuid, TackTeamMembership> = teams
         .into_iter()
-        .filter(|(_, _, products, _)| products.iter().any(|p| p == "tack"))
-        .filter_map(|(id, role, _, organization_id)| {
+        .filter_map(|(id, role, organization_id)| {
             let team_id = id.parse::<Uuid>().ok()?;
             Some((
                 team_id,
@@ -96,9 +105,7 @@ fn build_tack_user<'a>(
         .collect();
 
     if !is_admin && team_map.is_empty() {
-        return Err(AppError::Forbidden(
-            "Your account does not have access to Tack. Ask your team owner to enable Tack for your team.".into(),
-        ));
+        return Err(AppError::Forbidden("Your account does not belong to any team.".into()));
     }
 
     Ok(TackUser { user_id, is_admin, teams: team_map })
@@ -112,7 +119,7 @@ pub fn from_mcp_claims(claims: &ullav_mcp_auth::McpClaims) -> Result<TackUser, A
     build_tack_user(
         &claims.sub,
         &claims.roles,
-        claims.teams.iter().map(|(id, t)| (id, t.role.as_str(), t.products.as_slice(), t.organization_id.as_deref())),
+        claims.teams.iter().map(|(id, t)| (id, t.role.as_str(), t.organization_id.as_deref())),
     )
 }
 
@@ -146,7 +153,7 @@ where
         build_tack_user(
             &claims.sub,
             &claims.roles,
-            claims.teams.iter().map(|(id, t)| (id, t.role.as_str(), t.products.as_slice(), t.organization_id.as_deref())),
+            claims.teams.iter().map(|(id, t)| (id, t.role.as_str(), t.organization_id.as_deref())),
         )
     }
 }
@@ -185,6 +192,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_tack_user_grants_access_to_any_team_no_product_gate() {
+        // The whole point of this change: a team with no "tack" product
+        // slug at all (there's no such concept passed in anymore) still
+        // grants a non-admin caller a TackUser, with that team present.
+        let team_id = Uuid::new_v4().to_string();
+        let user = build_tack_user(
+            &Uuid::new_v4().to_string(),
+            &[],
+            [(&team_id, "member", None)],
+        )
+        .expect("a caller with any team membership should be granted access");
+        assert!(!user.is_admin);
+        assert_eq!(user.teams.len(), 1);
+        assert_eq!(user.teams[&team_id.parse().unwrap()].role, "member");
+    }
+
+    #[test]
+    fn build_tack_user_rejects_a_non_admin_with_no_teams_at_all() {
+        let result = build_tack_user(&Uuid::new_v4().to_string(), &[], std::iter::empty());
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn build_tack_user_admits_an_admin_with_no_teams() {
+        let user = build_tack_user(&Uuid::new_v4().to_string(), &["admin".to_string()], std::iter::empty())
+            .expect("an admin should be granted access even with zero team memberships");
+        assert!(user.is_admin);
+        assert!(user.teams.is_empty());
+    }
 
     #[test]
     fn organization_ids_dedupes_across_teams_in_the_same_org() {
