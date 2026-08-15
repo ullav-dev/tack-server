@@ -106,7 +106,10 @@ mod scope_guard_tests {
 #[openapi(
     info(
         title = "Tack Server API",
-        version = "0.1.0",
+        // Kept in sync with Cargo.toml's package.version by hand -- utoipa's
+        // #[openapi(...)] macro requires a string literal here, `env!("CARGO_PKG_VERSION")`
+        // doesn't parse (confirmed: "error: expected string literal").
+        version = "26.2.0",
         description = "Notes & Pages content platform"
     ),
     paths(
