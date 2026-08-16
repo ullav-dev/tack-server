@@ -8,7 +8,12 @@
 # onnxruntime binary needs glibc >= 2.38 and a newer libstdc++ ABI than
 # bookworm ships. The runtime stage below must match for the same reason
 # (a binary linked against newer glibc symbols won't run on an older one).
-FROM rust:1.91-slim-trixie AS builder
+#
+# 1.91 -> 1.97: see Dockerfile's own comment -- surrealdb's fastnum/diskann
+# transitive dependencies need rustc >= 1.94 (fastnum's declared MSRV) and
+# diskann 0.54.0 fails to compile under 1.91.1 specifically (a real
+# lifetime-inference gap, confirmed via a real `docker build`).
+FROM rust:1.97-slim-trixie AS builder
 
 WORKDIR /app
 
