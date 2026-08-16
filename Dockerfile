@@ -11,7 +11,18 @@
 # stage below must use a matching trixie-based image too -- a binary linked
 # against glibc 2.38+ symbols won't run on an older glibc at all, so bumping
 # only this stage would trade a build failure for a runtime crash instead.
-FROM rust:1.91-slim-trixie AS builder
+#
+# 1.91 -> 1.97: the surrealdb dependency (added for backfill-clann-notes.rs)
+# pulls in fastnum (declared rust-version 1.94, a hard MSRV floor) and
+# diskann 0.54.0, which fails to compile under 1.91.1 specifically with
+# `error[E0311]: ... may not live long enough` on several `impl
+# SendFuture<...>` return-position-impl-trait methods in its graph/index.rs
+# -- a real rustc-version-sensitive lifetime-inference gap, not a platform
+# issue (confirmed via a real `docker build` on this exact image, not
+# assumed from `cargo build --release` succeeding natively on a newer local
+# toolchain, which does not reproduce it). 1.97 (only trixie tag comfortably
+# past 1.94 available at the time of this fix) compiles both cleanly.
+FROM rust:1.97-slim-trixie AS builder
 
 WORKDIR /app
 
