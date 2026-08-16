@@ -52,6 +52,16 @@ schemars = "1.0"
 # HTTP client (auth proxy / cross-app reference resolution)
 reqwest = { version = "0.12", features = ["json"] }
 
+# SurrealDB client -- for backfill-clann-notes only (clann-server's own
+# source DB). No other part of this crate touches SurrealDB; tack-server's
+# own storage is exclusively Postgres. See that binary's own doc comment.
+surrealdb = { version = "3", default-features = false, features = ["protocol-ws"] }
+
+# Body-hash verification (backfill-clann-notes) -- source-vs-destination
+# content integrity check, per the notes-backfill-runbook's "verify
+# byte-for-byte, not just row counts" step.
+sha2 = "0.10"
+
 # Embed migrations directory at compile time; run on every startup
 # (idempotent CREATE TABLE IF NOT EXISTS-style SQL) — matches ullav-dam-server's
 # migration pattern, not ullav-user-management's separate migrate-sidecar pattern.
