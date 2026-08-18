@@ -46,6 +46,9 @@ utoipa-swagger-ui = { version = "7", features = ["axum"] }
 
 # JWT validation (RS256 via UUM JWKS) + MCP server
 ullav-mcp-auth = { path = "../ullav-mcp-auth", default-features = false, features = ["axum-07"] }
+# Direct dep only so `main` can install jsonwebtoken's process-level
+# CryptoProvider explicitly at startup -- see that call site's doc comment.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session", "macros"] }
 schemars = "1.0"
 
