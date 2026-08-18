@@ -5588,6 +5588,7 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "include_dir",
+ "jsonwebtoken",
  "lru",
  "postgres-types",
  "reqwest",

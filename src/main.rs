@@ -273,6 +273,22 @@ async fn health(State(state): State<AppState>) -> StatusCode {
 /// building the runtime manually here lets that be capped via `Config`
 /// (loaded synchronously, before any runtime exists to size).
 fn main() -> Result<()> {
+    // `jsonwebtoken` 10.x can't auto-select a process-level `CryptoProvider`
+    // when more than one crypto-backend feature is enabled anywhere in the
+    // dependency graph -- unlike most Cargo features, this one isn't just
+    // "unioned" harmlessly. `ullav-mcp-auth` requests `rust_crypto`, but this
+    // crate's own `surrealdb` dependency (backfill-clann-notes only) pulls in
+    // `jsonwebtoken` with `aws_lc_rs` enabled too, via Cargo's single-version
+    // feature unification. With neither backend exclusively enabled,
+    // `jsonwebtoken::crypto::verify`/`sign` panics on first use -- which
+    // meant every authenticated request (any call through `TackUser` or the
+    // MCP auth middleware) 500'd, while unauthenticated routes like
+    // `/health` were unaffected. Install the same backend `ullav-mcp-auth`
+    // expects, explicitly, before any thread can reach a JWT call.
+    jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER
+        .install_default()
+        .expect("failed to install jsonwebtoken CryptoProvider (must run before any runtime thread starts)");
+
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())
