@@ -183,7 +183,12 @@ impl TackMcpServer {
             &self.db,
             db::notes::NewNote {
                 organization_id,
-                team_id,
+                // MCP's create_note tool always takes an explicit team_id
+                // (see its own required-params schema below) -- personal,
+                // team-less notes aren't exposed over MCP in this pass, same
+                // "explicitly deferred, not silently missing" posture as
+                // folders never getting an MCP tool either.
+                team_id: Some(team_id),
                 visibility,
                 created_by: user.user_id,
                 title: p.title,
