@@ -77,4 +77,13 @@ fastembed = "5"
 
 [profile.release]
 opt-level = 3
-lto = true
+# "thin" (per-crate LTO, still cross-crate-aware, parallelizable), not
+# `true`/"fat" (forces a single codegen unit, one full whole-program link) --
+# fat LTO was a major, measured contributor to this crate's 20+ minute CI
+# builds (see PR #48's Dockerfile fix for the other contributor). Switched
+# deliberately, with Colin's sign-off, on the reasoning that tack-server is
+# an I/O-bound web API (request handling, occasional embedding inference
+# that's already off the hot path per Embedder's own docs), not a
+# CPU-bound workload where fat LTO's last increment of codegen
+# optimization would actually be felt.
+lto = "thin"
