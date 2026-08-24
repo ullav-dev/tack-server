@@ -58,7 +58,20 @@ RUN rm -rf target/release/deps/*tack_server* target/release/deps/*tack_indexer* 
 # Build real binary
 COPY src ./src
 COPY migrations ./migrations
-RUN cargo build --release
+# --bin tack-server: unlike Dockerfile.indexer's own final build step (which
+# has always correctly scoped to --bin tack-indexer), this one was
+# unscoped -- `cargo build --release` with no --bin flag builds every
+# [[bin]] target in the crate, so this image's own build was *also*
+# compiling and fat-LTO-linking the entire tack-indexer binary every time,
+# despite the runtime stage below only ever copying out tack-server.
+# Confirmed via real GH Actions run timing (not assumed): tack-server's own
+# "Build and push" step was taking ~1178s against tack-indexer's own
+# separate, correctly-scoped build at ~722s for the *same* dependency
+# graph -- almost the entire gap was this one redundant LTO link, since
+# opt-level=3 + lto=true (see this crate's Cargo.toml) makes a full-crate
+# release link expensive, and this was happening twice per tack-server
+# image build instead of once.
+RUN cargo build --release --bin tack-server
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
