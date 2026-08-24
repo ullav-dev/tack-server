@@ -30,17 +30,27 @@
 //! deterministic and reproducible across runs -- but always as
 //! `Visibility::Private`, flagged in the log for a human to review
 //! individually, exactly like a single ambiguous team choice would be.
-//! Only "no team can be determined at all" is a hard skip (tack's own
-//! `CreateNoteRequest.team_id` is a required `Uuid`).
+//!
+//! A resolved tree with *no* team at all (a personal, not-team-linked
+//! Clann tree -- confirmed a real, common case against production: 10 of
+//! 11 real trees at last count) is no longer a hard skip. tack-server's
+//! `CreateNoteRequest.team_id` is optional now (see that struct's own doc
+//! comment): a genuinely private note (`is_shared = false`) on a
+//! team-less tree migrates as a real personal, team-less tack note
+//! instead. A *shared* note (`is_shared = true`) on a team-less tree is
+//! still a hard skip -- tack has no per-person sharing yet (Half B of the
+//! migration plan, deliberately unbuilt: nothing in production data needed
+//! it as of the last census run), and a shared note has no team whose
+//! membership could stand in for "who this was actually shared with".
 //!
 //! `description` (no column in tack's `Note` schema) is written to
-//! clann-server's own `tack_note_meta` sidecar table (`002_tack_migration_
-//! sidecar.surql`) via a direct SurrealDB write on the same connection used
-//! to read the source rows -- this script already has that connection open,
-//! and `tack_note_meta` is real, permanent Clann-side infrastructure (also
-//! used by the future Phase 3 live-handler rewiring and by
-//! `reverse-drain-clann-notes.rs`'s own description recovery), not
-//! migration-run bookkeeping.
+//! clann-server's own `tack_note_meta` sidecar table (folded into
+//! `migrations/schema.surql` -- see that file's own header) via a direct
+//! SurrealDB write on the same connection used to read the source rows --
+//! this script already has that connection open, and `tack_note_meta` is
+//! real, permanent Clann-side infrastructure (also used by the future
+//! Phase 3 live-handler rewiring and by `reverse-drain-clann-notes.rs`'s
+//! own description recovery), not migration-run bookkeeping.
 //!
 //! Empty `body_markdown` is a real, hit-in-production failure mode (see the
 //! runbook's Step 2/3): tack-server's `create_note`/`create_reply` both
@@ -360,6 +370,12 @@ async fn main() -> Result<()> {
     enum Decision {
         Migrate { team_id: String, visibility: &'static str },
         Ambiguous { team_id: String, all_candidates: Vec<String> },
+        /// A private note on a resolved-but-team-less tree -- migrates as a
+        /// real personal, team-less tack note (`POST /notes` with `team_id`
+        /// omitted, `visibility: private`). Never produced for a shared
+        /// note (see `decide`'s own doc comment) or an unresolved/no-slug
+        /// note -- both stay a hard `Skip`.
+        Personal,
         Skip(&'static str),
     }
     fn decide(is_shared: bool, resolved_team_ids: &BTreeSet<String>, had_slugs: bool, had_resolved_trees: bool) -> Decision {
@@ -370,7 +386,12 @@ async fn main() -> Result<()> {
             return Decision::Skip("all_tree_slugs_unresolvable");
         }
         match resolved_team_ids.len() {
-            0 => Decision::Skip("no_team_on_any_resolved_tree"),
+            0 if !is_shared => Decision::Personal,
+            // Shared with no team: no per-person sharing in tack yet
+            // (Half B, deliberately unbuilt) and no team membership to
+            // stand in for "who this was shared with" -- a hard skip, not
+            // guessed at.
+            0 => Decision::Skip("shared_note_on_team_less_tree_not_yet_supported"),
             1 => Decision::Migrate {
                 team_id: resolved_team_ids.iter().next().unwrap().clone(),
                 visibility: if is_shared { "team" } else { "private" },
@@ -395,7 +416,7 @@ async fn main() -> Result<()> {
         decisions.insert(&n.id, decide(n.is_shared, &resolved_team_ids, had_slugs, had_resolved_trees));
     }
 
-    let (mut to_migrate, mut ambiguous, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut to_migrate, mut ambiguous, mut personal, mut skipped) = (0usize, 0usize, 0usize, 0usize);
     for d in decisions.values() {
         match d {
             Decision::Migrate { .. } => to_migrate += 1,
@@ -403,13 +424,17 @@ async fn main() -> Result<()> {
                 to_migrate += 1;
                 ambiguous += 1;
             }
+            Decision::Personal => {
+                to_migrate += 1;
+                personal += 1;
+            }
             Decision::Skip(reason) => {
                 skipped += 1;
                 tracing::warn!(reason, "note decision: skip");
             }
         }
     }
-    tracing::info!(to_migrate, ambiguous, skipped, "A0 decisions complete");
+    tracing::info!(to_migrate, ambiguous, personal, skipped, "A0 decisions complete");
 
     // Derived (legacy_folder_id, team_id) pairs -- known before any note is
     // created, so no separate folder-repoint phase is needed at all.
@@ -470,12 +495,13 @@ async fn main() -> Result<()> {
 
     for n in &top_level {
         let (team_id, visibility, is_ambiguous, all_candidates) = match decisions.get(n.id.as_str()) {
-            Some(Decision::Migrate { team_id, visibility }) => (team_id.clone(), *visibility, false, vec![]),
-            Some(Decision::Ambiguous { team_id, all_candidates }) => (team_id.clone(), "private", true, all_candidates.clone()),
+            Some(Decision::Migrate { team_id, visibility }) => (Some(team_id.clone()), *visibility, false, vec![]),
+            Some(Decision::Ambiguous { team_id, all_candidates }) => (Some(team_id.clone()), "private", true, all_candidates.clone()),
+            Some(Decision::Personal) => (None, "private", false, vec![]),
             _ => continue,
         };
         if is_ambiguous {
-            tracing::warn!(note_id = %n.id, %team_id, ?all_candidates, "note resolves to multiple teams -- migrated as private, chosen team is the lexicographically-first candidate; review individually");
+            tracing::warn!(note_id = %n.id, team_id = team_id.as_deref(), ?all_candidates, "note resolves to multiple teams -- migrated as private, chosen team is the lexicographically-first candidate; review individually");
         }
 
         if let Some(existing) = state.migrated.get(&n.id).copied() {
@@ -504,8 +530,22 @@ async fn main() -> Result<()> {
             notes_skipped += 1;
             continue;
         };
-        let Ok(team_uuid) = Uuid::parse_str(&team_id) else { continue };
-        let folder_uuid = n.folder_id.as_ref().and_then(|fid| folder_map.get(&(fid.clone(), team_id.clone()))).copied();
+        // team_id is None only for Decision::Personal, which decide() only
+        // ever produces for a genuinely private note (see decide()'s own
+        // match arm) -- folder_id is therefore always None too here (a
+        // team-less note has nothing to derive a folder against; the needed-
+        // folders loop above only ever considers Migrate/Ambiguous notes).
+        let team_uuid = match &team_id {
+            Some(id) => match Uuid::parse_str(id) {
+                Ok(uuid) => Some(uuid),
+                Err(_) => continue,
+            },
+            None => None,
+        };
+        let folder_uuid = match (&team_id, &n.folder_id) {
+            (Some(tid), Some(fid)) => folder_map.get(&(fid.clone(), tid.clone())).copied(),
+            _ => None,
+        };
         let created_at = n.created_at.as_deref().and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
         let body_before_hash = sha256_hex(&body);
         let dam_before = dam_url_count(&body);
