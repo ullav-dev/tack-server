@@ -13,3 +13,4 @@ target
 
 # Downloaded embedding model files (fastembed cache)
 .embedding-models/
+.env.clann-backfill-prod

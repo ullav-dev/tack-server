@@ -144,6 +144,24 @@ pub async fn resolve_team_organization_live(
     })
 }
 
+/// Resolves the organization to file a genuinely personal, team-less note
+/// under (`CreateNoteRequest.team_id` omitted) -- picks any one of the
+/// caller's own existing team memberships' organizations, deterministically
+/// (sorted, first). This is *only* ever valid for a `Visibility::Private`
+/// note: unlike `resolve_team_organization`, the returned org carries no ACL
+/// meaning for this note at all (nobody's membership in it grants access --
+/// see `can_view`), it's purely the Postgres shard key. A caller with no
+/// team anywhere gets a clear, actionable error rather than a note silently
+/// filed under a made-up organization -- matches the migration runbook's
+/// "skip and report, never guess" rule.
+pub fn resolve_personal_organization(user: &TackUser) -> AppResult<Uuid> {
+    user.organization_ids().into_iter().next().ok_or_else(|| {
+        AppError::BadRequest(
+            "You don't belong to any team with an organization assigned, so there's no organization to file a personal note under yet.".into(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +270,43 @@ mod tests {
         teams.insert(team_id, TackTeamMembership { role: "member".into(), organization_id: Some(n.organization_id) });
         let other_member = user(false, teams);
         assert!(!can_edit(&n, &other_member), "a team member who isn't the creator must not be able to edit");
+    }
+
+    // ── resolve_personal_organization ───────────────────────────────────────
+
+    #[test]
+    fn resolve_personal_organization_picks_one_of_the_callers_own_orgs() {
+        let org = Uuid::new_v4();
+        let mut teams = HashMap::new();
+        teams.insert(Uuid::new_v4(), TackTeamMembership { role: "member".into(), organization_id: Some(org) });
+        let u = user(false, teams);
+        assert_eq!(resolve_personal_organization(&u).unwrap(), org);
+    }
+
+    #[test]
+    fn resolve_personal_organization_is_deterministic_across_multiple_orgs() {
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        let mut teams = HashMap::new();
+        teams.insert(Uuid::new_v4(), TackTeamMembership { role: "member".into(), organization_id: Some(org_a) });
+        teams.insert(Uuid::new_v4(), TackTeamMembership { role: "member".into(), organization_id: Some(org_b) });
+        let u = user(false, teams);
+        let expected = [org_a, org_b].into_iter().min().unwrap();
+        assert_eq!(resolve_personal_organization(&u).unwrap(), expected, "must pick the same org every call, not vary run to run");
+    }
+
+    #[test]
+    fn resolve_personal_organization_rejects_a_user_with_no_org_anywhere() {
+        let u = user(false, HashMap::new());
+        assert!(matches!(resolve_personal_organization(&u), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn resolve_personal_organization_ignores_org_less_teams() {
+        let mut teams = HashMap::new();
+        teams.insert(Uuid::new_v4(), TackTeamMembership { role: "member".into(), organization_id: None });
+        let u = user(false, teams);
+        assert!(matches!(resolve_personal_organization(&u), Err(AppError::BadRequest(_))));
     }
 
     // ── resolve_team_organization_live ──────────────────────────────────────

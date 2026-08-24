@@ -89,12 +89,24 @@ pub struct AttachRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateNoteRequest {
-    /// The team to file this note under. Required even for a `private` note —
-    /// it's how the note's organization (the Postgres shard key) is resolved.
-    /// The team must be one of the caller's Tack-enabled teams, and must
+    /// The team to file this note under. Required for `team`/`organization`
+    /// visibility -- both need a real team to resolve who that actually
+    /// means. May be omitted only for a `private` note: the caller then
+    /// gets a genuinely personal note with no team at all (`team_id NULL`
+    /// on the row), the `organization_id` shard key resolved instead from
+    /// any one of the caller's own team memberships (a pure partition key
+    /// here, not an ACL boundary -- `Visibility::Private`'s ACL is already
+    /// `created_by == caller`, independent of team/org, so it doesn't
+    /// matter which of the caller's orgs gets picked). Once created this
+    /// way, the note can never be widened off `Private` (see
+    /// `handlers::notes::update_note`) -- there's no team to legitimately
+    /// grant `team`/`organization` visibility against. When `team_id` *is*
+    /// given, it must be one of the caller's Tack-enabled teams, and must
     /// already have an organization assigned (see the Organizations
-    /// migration in ullav-user-management).
-    pub team_id: Uuid,
+    /// migration in ullav-user-management) -- unchanged from before this
+    /// field became optional.
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
     pub visibility: Visibility,
     pub title: String,
     pub body_markdown: String,

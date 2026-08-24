@@ -12,9 +12,11 @@ use crate::error::{AppError, AppResult};
 use crate::handlers::note_folders::check_folder_in_team;
 use crate::models::note::{
     AttachRequest, CreateNoteRequest, Note, NoteAttachment, NoteRead, NoteRevision, NoteUnreadStatus, NotesPage, ReplyRequest,
-    UpdateNoteRequest,
+    UpdateNoteRequest, Visibility,
 };
-use crate::notes_acl::{can_edit, resolve_team_organization, resolve_team_organization_live, resolve_visible_note};
+use crate::notes_acl::{
+    can_edit, resolve_personal_organization, resolve_team_organization, resolve_team_organization_live, resolve_visible_note,
+};
 use crate::AppState;
 
 #[utoipa::path(
@@ -36,19 +38,39 @@ pub async fn create_note(
     if body.body_markdown.trim().is_empty() {
         return Err(AppError::BadRequest("body_markdown must not be empty".into()));
     }
-    // Live-resolution fallback only actually does anything (a network call)
-    // for an admin caller on a team outside their own JWT claims -- see
-    // `resolve_team_organization_live`'s doc comment. Every other caller
-    // takes the exact same fast JWT-only path `resolve_team_organization`
-    // always did.
-    let organization_id = resolve_team_organization_live(&state, &user, &raw_token, body.team_id).await?;
-    if let Some(folder_id) = body.folder_id {
+    // Two paths: a normal team-filed note (unchanged from before `team_id`
+    // became optional), or a genuinely personal note with no team at all --
+    // only ever valid for `Visibility::Private`, since there's no team to
+    // grant `team`/`organization` visibility against. See
+    // `CreateNoteRequest::team_id`'s own doc comment.
+    let organization_id = match body.team_id {
+        Some(team_id) => {
+            // Live-resolution fallback only actually does anything (a
+            // network call) for an admin caller on a team outside their own
+            // JWT claims -- see `resolve_team_organization_live`'s doc
+            // comment. Every other caller takes the exact same fast
+            // JWT-only path `resolve_team_organization` always did.
+            resolve_team_organization_live(&state, &user, &raw_token, team_id).await?
+        }
+        None => {
+            if body.visibility != Visibility::Private {
+                return Err(AppError::BadRequest(
+                    "A note with no team must be private -- team/organization visibility needs a real team.".into(),
+                ));
+            }
+            if body.folder_id.is_some() {
+                return Err(AppError::BadRequest("A personal note with no team can't be filed into a folder.".into()));
+            }
+            resolve_personal_organization(&user)?
+        }
+    };
+    if let (Some(team_id), Some(folder_id)) = (body.team_id, body.folder_id) {
         let attachments: Vec<(&str, &str, &str)> = body
             .attach
             .as_ref()
             .map(|a| vec![(a.owning_service.as_str(), a.entity_type.as_str(), a.entity_id.as_str())])
             .unwrap_or_default();
-        check_folder_in_team(&state, organization_id, body.team_id, folder_id, user.user_id, &attachments).await?;
+        check_folder_in_team(&state, organization_id, team_id, folder_id, user.user_id, &attachments).await?;
     }
     // Backfill-only: only an admin caller's created_at override is honored,
     // so an ordinary API consumer can never backdate a note.
@@ -159,7 +181,11 @@ const MAX_NOTES_LIMIT: i64 = 100;
 
 #[derive(Debug, Deserialize)]
 pub struct ListNotesQuery {
-    pub team_id: Uuid,
+    /// Omit to list the caller's own personal (team-less) notes instead --
+    /// see `list_notes`'s doc comment. `folder_id`/`unfiled` are meaningless
+    /// without a team (a personal note can never be filed) and are rejected
+    /// together with an omitted `team_id`.
+    pub team_id: Option<Uuid>,
     /// Defaults to 20, capped at 100.
     pub limit: Option<i64>,
     /// Defaults to 0.
@@ -173,17 +199,30 @@ pub struct ListNotesQuery {
     pub unfiled: bool,
 }
 
+/// Team-filed notes: unchanged pagination behavior from before `team_id`
+/// became optional. Personal notes (`team_id` omitted): no folder concept
+/// (a team-less note can never be filed, see `create_note`), and no
+/// `has_more`-by-overfetch pagination either -- fetched across every one of
+/// the caller's own organizations and merged/sorted/sliced in Rust, same
+/// per-org-loop shape `GET /note-folders`/`GET /spaces` already use,
+/// because a personal note's `organization_id` was picked arbitrarily (any
+/// one of the caller's orgs at creation time -- `resolve_personal_
+/// organization`) and isn't known up front. Real-world personal-note volume
+/// per caller is expected to be small (see the Clann migration's own
+/// numbers), so fetching the full set per org rather than a true DB-level
+/// LIMIT/OFFSET is the same accepted tradeoff `GET /spaces/:id/pages`
+/// documents for its own live-per-row filter.
 #[utoipa::path(
     get,
     path = "/notes",
     params(
-        ("team_id" = Uuid, Query, description = "List top-level notes filed under this team"),
+        ("team_id" = Option<Uuid>, Query, description = "List top-level notes filed under this team. Omit to list the caller's own personal (team-less) notes instead."),
         ("limit" = Option<i64>, Query, description = "Page size, default 20, max 100"),
         ("offset" = Option<i64>, Query, description = "Offset into the (newest-first) list, default 0"),
-        ("folder_id" = Option<Uuid>, Query, description = "Only notes filed in this folder"),
-        ("unfiled" = Option<bool>, Query, description = "Only notes with no folder"),
+        ("folder_id" = Option<Uuid>, Query, description = "Only notes filed in this folder (team-scoped only)"),
+        ("unfiled" = Option<bool>, Query, description = "Only notes with no folder (team-scoped only)"),
     ),
-    responses((status = 200, description = "A page of top-level notes for this team", body = NotesPage)),
+    responses((status = 200, description = "A page of top-level notes", body = NotesPage)),
     tag = "notes"
 )]
 pub async fn list_notes(
@@ -194,17 +233,31 @@ pub async fn list_notes(
     if query.folder_id.is_some() && query.unfiled {
         return Err(AppError::BadRequest("folder_id and unfiled are mutually exclusive.".into()));
     }
-    let organization_id = resolve_team_organization(&user, query.team_id)?;
     let limit = query.limit.unwrap_or(DEFAULT_NOTES_LIMIT).clamp(1, MAX_NOTES_LIMIT);
     let offset = query.offset.unwrap_or(0).max(0);
+
+    let Some(team_id) = query.team_id else {
+        if query.folder_id.is_some() || query.unfiled {
+            return Err(AppError::BadRequest("folder_id/unfiled require team_id -- a personal note is never filed.".into()));
+        }
+        let mut all = Vec::new();
+        for org_id in user.organization_ids() {
+            all.extend(db::notes::list_personal_notes(&state.db, org_id, user.user_id).await?);
+        }
+        all.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        let total = all.len() as i64;
+        let page: Vec<_> = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let has_more = offset + (page.len() as i64) < total;
+        return Ok(Json(NotesPage { notes: page, has_more, total }));
+    };
+
+    let organization_id = resolve_team_organization(&user, team_id)?;
     let folder = match (query.folder_id, query.unfiled) {
         (Some(id), _) => Some(FolderScope::Folder(id)),
         (None, true) => Some(FolderScope::Unfiled),
         (None, false) => None,
     };
-    let notes =
-        db::notes::list_team_notes(&state.db, organization_id, query.team_id, user.user_id, folder, limit, offset)
-            .await?;
+    let notes = db::notes::list_team_notes(&state.db, organization_id, team_id, user.user_id, folder, limit, offset).await?;
     Ok(Json(notes))
 }
 
@@ -248,6 +301,22 @@ pub async fn update_note(
     if let Some(ref body_markdown) = body.body_markdown {
         if body_markdown.trim().is_empty() {
             return Err(AppError::BadRequest("body_markdown must not be empty".into()));
+        }
+    }
+    // A personal, team-less note can never be widened off `Private` -- there
+    // was never a team to legitimately grant `team`/`organization`
+    // visibility against, and `organization_id` on this row is a pure shard
+    // key picked arbitrarily at creation (`resolve_personal_organization`),
+    // not something whose membership should ever gate access. See
+    // `CreateNoteRequest::team_id`'s doc comment for the create-time half of
+    // this invariant.
+    if note.team_id.is_none() {
+        if let Some(new_visibility) = body.visibility {
+            if new_visibility != Visibility::Private {
+                return Err(AppError::BadRequest(
+                    "This note has no team, so it can only ever be private.".into(),
+                ));
+            }
         }
     }
     if let Some(folder_id) = body.folder_id {

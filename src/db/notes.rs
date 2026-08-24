@@ -52,7 +52,12 @@ pub struct NewAttachment {
 
 pub struct NewNote {
     pub organization_id: Uuid,
-    pub team_id: Uuid,
+    /// `None` for a personal, team-less note -- the handler has already
+    /// enforced `visibility == Private` in that case
+    /// (`handlers::notes::create_note`), so this column being nullable
+    /// never widens who can see the note; it only changes how
+    /// `organization_id` itself got resolved.
+    pub team_id: Option<Uuid>,
     pub visibility: Visibility,
     pub created_by: Uuid,
     pub title: String,
@@ -444,6 +449,32 @@ pub async fn list_team_notes(
     };
 
     Ok(crate::models::note::NotesPage { notes, has_more, total })
+}
+
+/// Top-level notes with no team at all (`team_id IS NULL`) -- always
+/// exactly the caller's own, since a team-less note is forced to
+/// `visibility = 'private'` at creation (`handlers::notes::create_note`)
+/// and stays that way forever (`handlers::notes::update_note` refuses to
+/// widen it) -- so this doesn't need the `visibility != 'private' OR
+/// created_by = $2` clause `list_team_notes` needs, `created_by = $2` alone
+/// is both necessary and sufficient. One organization at a time -- see
+/// `handlers::notes::list_notes`'s doc comment for why the caller loops
+/// this over every one of their organizations and merges in Rust, same
+/// shape as `GET /note-folders`/`GET /spaces`'s existing per-org loop.
+pub async fn list_personal_notes(
+    pool: &Pool,
+    organization_id: Uuid,
+    caller_id: Uuid,
+) -> Result<Vec<Note>, AppError> {
+    let client = pool.get().await?;
+    let sql = format!(
+        "{NOTE_SELECT}
+         WHERE n.organization_id = $1 AND n.team_id IS NULL AND n.parent_id IS NULL
+           AND n.deleted_at IS NULL AND n.created_by = $2
+         ORDER BY n.created_at DESC"
+    );
+    let rows = client.query(&sql, &[&organization_id, &caller_id]).await?;
+    Ok(rows.iter().map(row_to_note).collect())
 }
 
 pub async fn list_replies(pool: &Pool, parent_id: Uuid, organization_id: Uuid) -> Result<Vec<Note>, AppError> {
